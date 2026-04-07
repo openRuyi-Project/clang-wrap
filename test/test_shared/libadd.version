@@ -1,0 +1,7 @@
+LIBADD_1.0 {
+    global:
+        add;
+        addf;
+    local:
+        *;
+};

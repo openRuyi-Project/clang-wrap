@@ -1,0 +1,8 @@
+#ifndef LIBADD_H
+#define LIBADD_H
+
+int add(int a, int b);
+
+float addf(float a, float b);
+
+#endif
