@@ -3,9 +3,9 @@
 // SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
 // SPDX-License-Identifier: MulanPSL-2.0
 
-//! mv 包装器
+//! mv wrapper
 //!
-//! 在执行 mv 命令后，同步移动 llvmir 目录中的对应文件
+//! After executing mv command, synchronously move corresponding files in llvmir directory
 
 use std::env;
 use std::fs;
@@ -17,7 +17,7 @@ use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, is_debug_mode,
     compute_llvmir_path, compute_llvmir_target_dir, ensure_dir_exists,
     sync_llvmir_with_aux_files, DEBUG_LOG_PATH};
 
-/// 通用文件操作参数
+/// Common file operation parameters
 struct FileOpArgs {
     sources: Vec<PathBuf>,
     destination: Option<PathBuf>,
@@ -25,7 +25,7 @@ struct FileOpArgs {
     other_args: Vec<String>,
 }
 
-/// 解析 mv 命令参数
+/// Parse mv command arguments
 fn parse_mv_args(args: &[String]) -> FileOpArgs {
     let mut result = FileOpArgs {
         sources: Vec::new(),
@@ -70,7 +70,7 @@ fn parse_mv_args(args: &[String]) -> FileOpArgs {
     result
 }
 
-/// 执行 mv 命令
+/// Execute mv command
 fn execute_mv(mv_path: &Path, args: &[String], debug: bool) -> i32 {
     debug_log(debug, &format!("[DEBUG] Executing mv: {} {}", mv_path.display(), args.join(" ")));
     
@@ -82,7 +82,7 @@ fn execute_mv(mv_path: &Path, args: &[String], debug: bool) -> i32 {
     status.code().unwrap_or(1)
 }
 
-/// 处理源文件的 llvmir 同步（移动到目标目录）
+/// Handle source file llvmir sync (move to target directory)
 fn process_source_llvmir(
     mv_path: &Path,
     source: &Path,
@@ -123,7 +123,7 @@ fn main() {
     let debug = is_debug_mode();
     let llvmir_dir = get_llvm_ir_dir();
     
-    // 初始化调试日志
+    // Initialize debug log
     if debug {
         let log_path = PathBuf::from(&llvmir_dir).join("mv-wrap.log");
         let _ = DEBUG_LOG_PATH.set(log_path);
@@ -142,14 +142,14 @@ fn main() {
         exit(status.code().unwrap_or(1));
     }
     
-    // 先执行原始的 mv 命令
+    // First execute original mv command
     let mv_result = execute_mv(&mv_path, &args[1..], debug);
     
     if mv_result != 0 {
         exit(mv_result);
     }
     
-    // 解析参数
+    // Parse arguments
     let parsed = parse_mv_args(&args[1..]);
     
     debug_log(debug, "[DEBUG] Parsed mv args:");
@@ -157,7 +157,7 @@ fn main() {
     debug_log(debug, &format!("[DEBUG]   destination: {:?}", parsed.destination));
     debug_log(debug, &format!("[DEBUG]   target_dir: {:?}", parsed.target_dir));
     
-    // 情况 1: 使用 -t DIRECTORY 指定目标目录
+    // Case 1: Use -t DIRECTORY to specify target directory
     if let Some(ref target_dir) = parsed.target_dir {
         for source in &parsed.sources {
             process_source_llvmir(&mv_path, source, target_dir, &parsed.other_args, &llvmir_dir, debug);
@@ -165,7 +165,7 @@ fn main() {
         exit(0);
     }
     
-    // 情况 2: 多个源文件，最后一个参数是目标目录
+    // Case 2: Multiple source files, last argument is target directory
     if parsed.sources.len() > 1 && parsed.destination.is_some() {
         let dest = parsed.destination.as_ref().unwrap();
         
@@ -177,7 +177,7 @@ fn main() {
         }
     }
     
-    // 情况 3: 单个源文件，有明确的目标
+    // Case 3: Single source file, with explicit target
     if parsed.sources.len() == 1 {
         let source = &parsed.sources[0];
         

@@ -3,9 +3,9 @@
 // SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
 // SPDX-License-Identifier: MulanPSL-2.0
 
-//! install 包装器
+//! install wrapper
 //!
-//! 在执行 install 命令后，同步安装 llvmir 目录中的对应文件
+//! After executing install command, synchronously install corresponding files in llvmir directory
 
 use std::env;
 use std::fs;
@@ -15,7 +15,7 @@ use std::process::{Command, exit};
 use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, is_debug_mode,
     get_program_name, resolve_cmd_name, get_absolute_path};
 
-/// 解析 install 命令参数
+/// Parse install command arguments
 struct InstallArgs {
     create_dirs: bool,
     target_dir: Option<PathBuf>,
@@ -91,13 +91,13 @@ fn parse_install_args(args: &[String]) -> InstallArgs {
     result
 }
 
-/// 在 llvmir 目录中查找对应的 LLVM IR 文件
+/// Find corresponding LLVM IR files in llvmir directory
 fn find_llvmir_files_internal(source: &Path, llvmir_dir: &str, source_basename: Option<&str>) -> Vec<PathBuf> {
     let mut result = Vec::new();
     
     let abs_source = get_absolute_path(source);
     
-    // 如果源文件是符号链接，获取其解析后的路径
+    // If source file is a symlink, get its resolved path
     let abs_source_resolved = if source.is_symlink() {
         if let Ok(target) = abs_source.read_link() {
             let parent = abs_source.parent().unwrap_or(&abs_source);
@@ -109,13 +109,13 @@ fn find_llvmir_files_internal(source: &Path, llvmir_dir: &str, source_basename: 
         abs_source.clone()
     };
     
-    // 构建 llvmir 中的路径
+    // Build path in llvmir
     let mut ir_path = PathBuf::from(llvmir_dir);
     let rel_path = abs_source.strip_prefix("/")
         .unwrap_or(&abs_source);
     ir_path.push(rel_path);
     
-    // 如果源文件是符号链接，也构建解析后路径对应的 llvmir 路径
+    // If source file is a symlink, also build llvmir path for resolved path
     let ir_path_resolved = if abs_source_resolved != abs_source {
         let mut resolved = PathBuf::from(llvmir_dir);
         let rel_resolved = abs_source_resolved.strip_prefix("/")
@@ -126,7 +126,7 @@ fn find_llvmir_files_internal(source: &Path, llvmir_dir: &str, source_basename: 
         None
     };
     
-    // 1. 检查同名的 LLVM bitcode 文件
+    // 1. Check LLVM bitcode file with same name
     if ir_path.exists() {
         result.push(ir_path.clone());
     }
@@ -137,13 +137,13 @@ fn find_llvmir_files_internal(source: &Path, llvmir_dir: &str, source_basename: 
         result.push(bc_path);
     }
     
-    // 2. 检查 _cmd 文件
+    // 2. Check _cmd file
     let cmd_path = PathBuf::from(format!("{}_cmd", ir_path.display()));
     if cmd_path.exists() {
         result.push(cmd_path);
     }
     
-    // 如果源文件是符号链接，还要检查解析后路径的 _cmd 文件
+    // If source file is a symlink, also check _cmd file for resolved path
     if let Some(ref ir_path_resolved) = ir_path_resolved {
         let cmd_path_resolved = PathBuf::from(format!("{}_cmd", ir_path_resolved.display()));
         if cmd_path_resolved.exists() && !result.contains(&cmd_path_resolved) {
@@ -155,7 +155,7 @@ fn find_llvmir_files_internal(source: &Path, llvmir_dir: &str, source_basename: 
         }
     }
     
-    // 如果源文件名以 T 结尾，还需要查找去掉 T 后缀的 _cmd 文件
+    // If source filename ends with T, also need to find _cmd file without T suffix
     if let Some(basename) = source_basename {
         if basename.ends_with('T') {
             let base_without_t = &basename[..basename.len()-1];
@@ -167,7 +167,7 @@ fn find_llvmir_files_internal(source: &Path, llvmir_dir: &str, source_basename: 
         }
     }
     
-    // 3. 检查 verscript 文件
+    // 3. Check verscript file
     let vs_path = PathBuf::from(format!("{}_verscript", ir_path.display()));
     if vs_path.exists() && !result.contains(&vs_path) {
         result.push(vs_path);
@@ -183,14 +183,14 @@ fn find_llvmir_files_internal(source: &Path, llvmir_dir: &str, source_basename: 
     result
 }
 
-/// 在 llvmir 目录中查找对应的 LLVM IR 文件
+/// Find corresponding LLVM IR files in llvmir directory
 fn find_llvmir_files(source: &Path, llvmir_dir: &str) -> Vec<PathBuf> {
     let basename = source.file_name()
         .and_then(|n| n.to_str());
     find_llvmir_files_internal(source, llvmir_dir, basename)
 }
 
-/// 判断源文件是否是共享库
+/// Determine if source file is a shared library
 fn is_shared_library(path: &Path) -> bool {
     let filename = path.file_name()
         .and_then(|n| n.to_str())
@@ -217,49 +217,49 @@ fn is_shared_library(path: &Path) -> bool {
     false
 }
 
-/// 从 _cmd 文件内容中提取 soname
+/// Extract soname from _cmd file content
 ///
-/// 查找 -Wl,-soname,xxx 或 -Wl,-h,xxx 格式的参数
+/// Look for arguments in -Wl,-soname,xxx or -Wl,-h,xxx format
 fn extract_soname_from_cmd_content(cmd_content: &str) -> Option<String> {
-    // 遍历命令行的每个参数
+    // Iterate through each argument in command line
     for part in cmd_content.split_whitespace() {
-        // 检查 -Wl,-soname,xxx 或 -Wl,-soname=xxx 格式
+        // Check -Wl,-soname,xxx or -Wl,-soname=xxx format
         if part.starts_with("-Wl,-soname,") || part.starts_with("-Wl,-soname=") {
             let soname = if part.starts_with("-Wl,-soname,") {
-                &part[12..]  // "-Wl,-soname," 的长度
+                &part[12..]  // length of "-Wl,-soname,"
             } else {
-                &part[12..]  // "-Wl,-soname=" 的长度也是12
+                &part[12..]  // length of "-Wl,-soname=" is also 12
             };
             if !soname.is_empty() {
                 return Some(soname.to_string());
             }
         }
         
-        // 检查 -Wl,-h,xxx 或 -Wl,-h=xxx 格式（-h 是 soname 的简写）
+        // Check -Wl,-h,xxx or -Wl,-h=xxx format (-h is shorthand for soname)
         if part.starts_with("-Wl,-h,") || part.starts_with("-Wl,-h=") {
             let soname = if part.starts_with("-Wl,-h,") {
-                &part[7..]  // "-Wl,-h," 的长度
+                &part[7..]  // length of "-Wl,-h,"
             } else {
-                &part[7..]  // "-Wl,-h=" 的长度也是7
+                &part[7..]  // length of "-Wl,-h=" is also 7
             };
             if !soname.is_empty() {
                 return Some(soname.to_string());
             }
         }
         
-        // 检查 -soname xxx 格式（分开的参数）
+        // Check -soname xxx format (separate arguments)
         if part == "-soname" || part == "-h" {
-            // 下一个参数就是 soname，但这里需要更复杂的解析
-            // 暂时跳过，主要处理 -Wl,-soname,xxx 格式
+            // Next argument is soname, but this requires more complex parsing
+            // Skip for now, mainly handle -Wl,-soname,xxx format
         }
     }
     
     None
 }
 
-/// 从 _cmd 文件中提取 soname
+/// Extract soname from _cmd file
 ///
-/// 读取 _cmd 文件内容，查找 -Wl,-soname,xxx 格式的参数
+/// Read _cmd file content, look for -Wl,-soname,xxx format arguments
 fn extract_soname_from_cmd_file(cmd_file: &Path) -> Option<String> {
     if let Ok(content) = fs::read_to_string(cmd_file) {
         extract_soname_from_cmd_content(&content)
@@ -268,7 +268,7 @@ fn extract_soname_from_cmd_file(cmd_file: &Path) -> Option<String> {
     }
 }
 
-/// 从 llvmir 文件列表中找到 _cmd 文件
+/// Find _cmd file from llvmir file list
 fn find_cmd_file(llvmir_files: &[PathBuf]) -> Option<PathBuf> {
     for f in llvmir_files {
         let name = f.file_name()
@@ -281,7 +281,7 @@ fn find_cmd_file(llvmir_files: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-/// 判断源文件是否是可执行程序
+/// Determine if source file is an executable program
 fn is_executable(path: &Path) -> bool {
     let filename = path.file_name()
         .and_then(|n| n.to_str())
@@ -309,7 +309,7 @@ fn is_executable(path: &Path) -> bool {
     false
 }
 
-/// 确定 LLVM IR 的安装目标目录
+/// Determine LLVM IR install target directory
 fn get_llvmir_install_dir(dest_dir: &Path, is_shared: bool, is_exec: bool) -> PathBuf {
     let dest_str = dest_dir.to_string_lossy();
     
@@ -336,7 +336,7 @@ fn get_llvmir_install_dir(dest_dir: &Path, is_shared: bool, is_exec: bool) -> Pa
     }
 }
 
-/// 执行原始的 install 命令
+/// Execute original install command
 fn execute_install(install_path: &Path, args: &[String], debug: bool) -> i32 {
     debug_log(debug, &format!("[DEBUG] Executing install: {} {}", install_path.display(), args.join(" ")));
     
@@ -348,7 +348,7 @@ fn execute_install(install_path: &Path, args: &[String], debug: bool) -> i32 {
     status.code().unwrap_or(1)
 }
 
-/// 安装单个 LLVM IR 文件
+/// Install single LLVM IR file
 fn install_llvmir_file(
     install_path: &Path,
     source: &Path,
@@ -396,13 +396,13 @@ fn install_llvmir_file(
     }
 }
 
-/// 根据源文件名和目标文件名，计算 llvmir 文件的目标文件名
+/// Compute llvmir file destination filename based on source and destination filenames
 ///
-/// 当目标文件名与源文件名不同时（如源是 libfoo.so，目标是 libfoo.so.1.2.3），
-/// llvmir 文件应使用从 _cmd 文件中提取的 soname 作为基础名
-/// 例如：源 libavcodec.so，目标 libavcodec.so.62.11.100
-/// _cmd 文件中包含 -Wl,-soname,libavcodec.so.62
-/// llvmir 文件应命名为：libavcodec.so.62_cmd, libavcodec.so.62_verscript, libavcodec.so.62.bc
+/// When destination filename differs from source (e.g., source is libfoo.so, target is libfoo.so.1.2.3),
+/// llvmir file should use soname extracted from _cmd file as base name
+/// Example: source libavcodec.so, target libavcodec.so.62.11.100
+/// _cmd file contains -Wl,-soname,libavcodec.so.62
+/// llvmir files should be named: libavcodec.so.62_cmd, libavcodec.so.62_verscript, libavcodec.so.62.bc
 fn compute_llvmir_dest_filename(llvmir_source: &Path, llvmir_files: &[PathBuf], original_source: &Path, dest: &Path) -> Option<String> {
     let llvmir_name = llvmir_source.file_name()
         .and_then(|n| n.to_str())
@@ -416,7 +416,7 @@ fn compute_llvmir_dest_filename(llvmir_source: &Path, llvmir_files: &[PathBuf], 
         .and_then(|n| n.to_str())
         .unwrap_or("");
     
-    // 处理源文件名以 T 结尾的情况（如 gcc 驱动程序使用的临时文件）
+    // Handle case where source filename ends with T (e.g., temp files used by gcc driver)
     if source_name.ends_with('T') {
         if llvmir_name.ends_with('T') {
             let base_name = &llvmir_name[..llvmir_name.len()-1];
@@ -424,22 +424,22 @@ fn compute_llvmir_dest_filename(llvmir_source: &Path, llvmir_files: &[PathBuf], 
         }
     }
     
-    // 如果是共享库且目标名与源名不同，使用 soname 作为基础
-    // 例如：源 libavcodec.so，目标 libavcodec.so.62.11.100
-    // 从 _cmd 文件中提取 soname：libavcodec.so.62
-    // llvmir 文件应命名为：libavcodec.so.62_cmd, libavcodec.so.62_verscript, libavcodec.so.62.bc
+    // If it's a shared library and target name differs from source, use soname as base
+    // Example: source libavcodec.so, target libavcodec.so.62.11.100
+    // Extract soname from _cmd file: libavcodec.so.62
+    // llvmir files should be named: libavcodec.so.62_cmd, libavcodec.so.62_verscript, libavcodec.so.62.bc
     if is_shared_library(dest) && dest_name != source_name {
-        // 从 _cmd 文件中提取 soname
+        // Extract soname from _cmd file
         let soname = if let Some(cmd_file) = find_cmd_file(llvmir_files) {
             extract_soname_from_cmd_file(&cmd_file)
         } else {
             None
         };
         
-        // 如果没有从 _cmd 文件中找到 soname，使用目标文件名
+        // If soname not found from _cmd file, use target filename
         let base_name = soname.as_deref().unwrap_or(dest_name);
         
-        // 确定 llvmir 文件的后缀类型
+        // Determine llvmir file suffix type
         let llvmir_suffix = if llvmir_name.ends_with("_cmd") {
             "_cmd"
         } else if llvmir_name.ends_with("_verscript") {
@@ -451,14 +451,14 @@ fn compute_llvmir_dest_filename(llvmir_source: &Path, llvmir_files: &[PathBuf], 
         };
         
         if llvmir_suffix.is_empty() {
-            // 对于没有特殊后缀的文件（如 .so 文件本身），使用 soname
+            // For files without special suffix (e.g., .so file itself), use soname
             return Some(base_name.to_string());
         } else if llvmir_suffix == ".bc" {
-            // 对于 .bc 文件，替换原有扩展名
-            // 例如：libavcodec.so.bc -> libavcodec.so.62.bc
+            // For .bc files, replace original extension
+            // Example: libavcodec.so.bc -> libavcodec.so.62.bc
             return Some(format!("{}.bc", base_name));
         } else {
-            // 对于 _cmd 和 _verscript 文件，直接追加后缀到 soname
+            // For _cmd and _verscript files, directly append suffix to soname
             return Some(format!("{}{}", base_name, llvmir_suffix));
         }
     }
@@ -469,13 +469,13 @@ fn compute_llvmir_dest_filename(llvmir_source: &Path, llvmir_files: &[PathBuf], 
 fn main() {
     let args: Vec<String> = env::args().collect();
     
-    // 获取程序名
+    // Get program name
     let program_name = get_program_name(&args);
     
-    // 确定实际要调用的命令
+    // Determine the actual command to invoke
     let install_cmd = resolve_cmd_name(program_name, "install-wrap", "install");
     
-    // 获取真正的 install 路径（跳过自己）
+    // Get the real install path (skip self)
     let install_path = get_exe_path(install_cmd);
     
     if args.len() < 2 {
@@ -488,7 +488,7 @@ fn main() {
     let debug = is_debug_mode();
     let llvmir_dir = get_llvm_ir_dir();
     
-    // 解析参数
+    // Parse arguments
     let parsed = parse_install_args(&args[1..]);
     
     debug_log(debug, &format!("[DEBUG] Parsed install args:"));
@@ -496,19 +496,19 @@ fn main() {
     debug_log(debug, &format!("[DEBUG]   sources: {:?}", parsed.sources));
     debug_log(debug, &format!("[DEBUG]   destination: {:?}", parsed.destination));
     
-    // 先执行原始的 install 命令
+    // First execute original install command
     let install_result = execute_install(&install_path, &args[1..], debug);
     
     if install_result != 0 {
         exit(install_result);
     }
     
-    // 如果是 -d 模式（创建目录），不需要处理 LLVM IR
+    // If -d mode (create directory), no need to process LLVM IR
     if parsed.create_dirs {
         exit(0);
     }
     
-    // 情况 1: 使用 -t DIRECTORY 指定目标目录
+    // Case 1: Use -t DIRECTORY to specify target directory
     if let Some(ref target_dir) = parsed.target_dir {
         for source in &parsed.sources {
             let llvmir_files = find_llvmir_files(source, &llvmir_dir);
@@ -540,7 +540,7 @@ fn main() {
         exit(0);
     }
     
-    // 情况 2: 多个源文件，最后一个参数是目标目录
+    // Case 2: Multiple source files, last argument is target directory
     if parsed.sources.len() > 1 && parsed.destination.is_some() {
         let dest = parsed.destination.as_ref().unwrap();
         
@@ -573,7 +573,7 @@ fn main() {
         exit(0);
     }
     
-    // 情况 3: 单个源文件，目标是文件名或目录
+    // Case 3: Single source file, target is filename or directory
     if parsed.sources.len() == 1 {
         let source = &parsed.sources[0];
         

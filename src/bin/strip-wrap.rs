@@ -5,7 +5,7 @@
 
 //! strip wrapper
 //!
-//! 在执行 strip 命令后，同步处理 llvmir 目录中的对应文件
+//! After executing strip command, synchronously process corresponding files in llvmir directory
 
 use std::env;
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, is_debug_mode,
     find_llvmir_file, compute_llvmir_path, copy_file, copy_and_modify_cmd_file,
     find_all_aux_files, AuxFileSuffix};
 
-/// 解析 strip 命令参数
+/// Parse strip command arguments
 struct StripArgs {
     files: Vec<PathBuf>,
     output: Option<PathBuf>,
@@ -92,7 +92,7 @@ fn main() {
     debug_log(debug, &format!("[DEBUG]   files: {:?}", parsed.files));
     debug_log(debug, &format!("[DEBUG]   output: {:?}", parsed.output));
     
-    // 执行原始的 strip 命令
+    // Execute original strip command
     let status = Command::new(&strip_path)
         .args(&args[1..])
         .status()
@@ -106,19 +106,19 @@ fn main() {
         exit(0);
     }
     
-    // 对于 llvmir 文件，只需要复制即可（不需要 strip）
+    // For llvmir files, just copy (no need to strip)
     if let Some(ref output) = parsed.output {
-        // 模式: strip -o OUTPUT FILE
+        // Mode: strip -o OUTPUT FILE
         for input_file in &parsed.files {
             if let Some(llvmir_source) = find_llvmir_file(input_file, &llvmir_dir) {
                 debug_log(debug, &format!("[DEBUG] Found llvmir file: {}", llvmir_source.display()));
                 
                 let llvmir_dest = compute_llvmir_path(output, &llvmir_dir);
                 
-                // 复制 llvmir 文件
+                // Copy llvmir file
                 copy_file(&llvmir_source, &llvmir_dest, debug);
                 
-                // 获取源文件名和目标文件名用于 _cmd 文件的修改
+                // Get source and destination filenames for _cmd file modification
                 let source_name = input_file.file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("input");
@@ -126,13 +126,13 @@ fn main() {
                     .and_then(|n| n.to_str())
                     .unwrap_or("output");
                 
-                // 复制辅助文件
+                // Copy auxiliary files
                 for (suffix, aux_source) in find_all_aux_files(&llvmir_source) {
                     let aux_dest = PathBuf::from(format!("{}{}", llvmir_dest.display(), suffix.as_str()));
                     debug_log(debug, &format!("[DEBUG] Copying aux file: {} -> {}", 
                               aux_source.display(), aux_dest.display()));
                     
-                    // _cmd 文件需要特殊处理（修改内容）
+                    // _cmd file needs special handling (modify content)
                     if matches!(suffix, AuxFileSuffix::Cmd) {
                         copy_and_modify_cmd_file(&aux_source, &aux_dest, source_name, dest_name, debug);
                     } else {
@@ -142,7 +142,7 @@ fn main() {
             }
         }
     } else {
-        // 模式: strip FILE... - 就地修改
+        // Mode: strip FILE... - in-place modification
         for input_file in &parsed.files {
             if let Some(llvmir_file) = find_llvmir_file(input_file, &llvmir_dir) {
                 debug_log(debug, &format!("[DEBUG] llvmir file exists at: {}", llvmir_file.display()));

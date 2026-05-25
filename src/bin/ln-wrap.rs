@@ -3,9 +3,9 @@
 // SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
 // SPDX-License-Identifier: MulanPSL-2.0
 
-//! ln 包装器
+//! ln wrapper
 //!
-//! 在执行 ln 命令后，同步在 llvmir 目录中创建链接
+//! After executing ln command, synchronously create links in llvmir directory
 
 use std::env;
 use std::fs;
@@ -17,7 +17,7 @@ use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, is_debug_mode,
     compute_llvmir_path, compute_llvmir_target_dir, ensure_dir_exists,
     sync_llvmir_with_aux_files};
 
-/// 通用文件操作参数
+/// Common file operation parameters
 struct FileOpArgs {
     targets: Vec<PathBuf>,
     link_name_or_dir: Option<PathBuf>,
@@ -25,7 +25,7 @@ struct FileOpArgs {
     other_args: Vec<String>,
 }
 
-/// 解析 ln 命令参数
+/// Parse ln command arguments
 fn parse_ln_args(args: &[String]) -> FileOpArgs {
     let mut result = FileOpArgs {
         targets: Vec::new(),
@@ -70,7 +70,7 @@ fn parse_ln_args(args: &[String]) -> FileOpArgs {
     result
 }
 
-/// 执行 ln 命令
+/// Execute ln command
 fn execute_ln(ln_path: &Path, args: &[String], debug: bool) -> i32 {
     debug_log(debug, &format!("[DEBUG] Executing ln: {} {}", ln_path.display(), args.join(" ")));
     
@@ -82,7 +82,7 @@ fn execute_ln(ln_path: &Path, args: &[String], debug: bool) -> i32 {
     status.code().unwrap_or(1)
 }
 
-/// 处理目标文件的 llvmir 同步（创建链接到目标目录）
+/// Handle target file llvmir sync (create link to target directory)
 fn process_target_llvmir(
     ln_path: &Path,
     target: &Path,
@@ -134,14 +134,14 @@ fn main() {
     let debug = is_debug_mode();
     let llvmir_dir = get_llvm_ir_dir();
     
-    // 先执行原始的 ln 命令
+    // First execute original ln command
     let ln_result = execute_ln(&ln_path, &args[1..], debug);
     
     if ln_result != 0 {
         exit(ln_result);
     }
     
-    // 解析参数
+    // Parse arguments
     let parsed = parse_ln_args(&args[1..]);
     
     debug_log(debug, "[DEBUG] Parsed ln args:");
@@ -149,7 +149,7 @@ fn main() {
     debug_log(debug, &format!("[DEBUG]   link_name_or_dir: {:?}", parsed.link_name_or_dir));
     debug_log(debug, &format!("[DEBUG]   target_dir: {:?}", parsed.target_dir));
     
-    // 情况 1: 使用 -t DIRECTORY 指定目标目录
+    // Case 1: Use -t DIRECTORY to specify target directory
     if let Some(ref target_dir) = parsed.target_dir {
         for target in &parsed.targets {
             process_target_llvmir(&ln_path, target, target_dir, &parsed.other_args, &llvmir_dir, debug);
@@ -157,7 +157,7 @@ fn main() {
         exit(0);
     }
     
-    // 情况 2: 多个目标文件，最后一个参数是目录
+    // Case 2: Multiple target files, last argument is directory
     if parsed.targets.len() > 1 && parsed.link_name_or_dir.is_some() {
         let link_dir = parsed.link_name_or_dir.as_ref().unwrap();
         
@@ -169,7 +169,7 @@ fn main() {
         }
     }
     
-    // 情况 3: 单个目标文件，有明确的链接名称
+    // Case 3: Single target file, with explicit link name
     if parsed.targets.len() == 1 {
         let target = &parsed.targets[0];
         
