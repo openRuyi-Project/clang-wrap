@@ -1,4 +1,9 @@
-//! strip 包装器
+// SPDX-FileCopyrightText: (C) 2026 Institute of Software, Chinese Academy of Sciences (ISCAS)
+// SPDX-FileCopyrightText: (C) 2026 openRuyi Project Contributors
+// SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
+// SPDX-License-Identifier: MulanPSL-2.0
+
+//! strip wrapper
 //!
 //! 在执行 strip 命令后，同步处理 llvmir 目录中的对应文件
 

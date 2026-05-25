@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: (C) 2026 Institute of Software, Chinese Academy of Sciences (ISCAS)
+// SPDX-FileCopyrightText: (C) 2026 openRuyi Project Contributors
+// SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
+// SPDX-License-Identifier: MulanPSL-2.0
+
 //! ln 包装器
 //!
 //! 在执行 ln 命令后，同步在 llvmir 目录中创建链接

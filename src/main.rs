@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: (C) 2026 Institute of Software, Chinese Academy of Sciences (ISCAS)
+// SPDX-FileCopyrightText: (C) 2026 openRuyi Project Contributors
+// SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
+// SPDX-License-Identifier: MulanPSL-2.0
+
 //! clang/clang++ 包装器
 //!
 //! 在编译时生成 LLVM IR，在链接时使用 llvm-link 合并 LLVM IR 文件

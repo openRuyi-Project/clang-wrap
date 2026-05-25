@@ -1,6 +1,11 @@
-//! ar/llvm-ar 包装器
+// SPDX-FileCopyrightText: (C) 2026 Institute of Software, Chinese Academy of Sciences (ISCAS)
+// SPDX-FileCopyrightText: (C) 2026 openRuyi Project Contributors
+// SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
+// SPDX-License-Identifier: MulanPSL-2.0
+
+//! ar/llvm-ar wrapper
 //!
-//! 在执行 ar 命令后，自动调用 llvm-link 合并 LLVM IR 文件
+//! After executing ar command, automatically invoke llvm-link to merge LLVM IR files
 
 use std::env;
 use std::fs;
@@ -14,10 +19,10 @@ use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, init_debug_log,
 fn main() {
     let args: Vec<String> = env::args().collect();
     
-    // 获取程序名
+    // Get program name
     let program_name = get_program_name(&args);
     
-    // 确定实际要调用的命令
+    // Determine the actual command to invoke
     let ar_cmd = if program_name == "ar-wrap" {
         "ar"
     } else if program_name == "llvm-ar-wrap" {
@@ -26,21 +31,21 @@ fn main() {
         program_name
     };
     
-    // 获取真正的 ar/llvm-ar 路径（跳过自己）
+    // Get the real ar/llvm-ar path (skip self)
     let ar_path = get_exe_path(ar_cmd);
     
     let debug = is_debug_mode();
     let emit_llvmir = is_emit_llvmir_enabled();
     let llvm_ir_dir = get_llvm_ir_dir();
     
-    // 初始化调试日志
+    // Initialize debug log
     if debug {
         init_debug_log(&llvm_ir_dir);
     }
     
     debug_log(debug, &format!("[DEBUG] Executing {}: {} {}", ar_path.display(), ar_cmd, args[1..].join(" ")));
     
-    // 解析 ar 命令参数
+    // Parse ar command arguments
     let mut is_create_or_replace = false;
     let mut archive_file: Option<PathBuf> = None;
     let mut member_files: Vec<PathBuf> = Vec::new();
@@ -50,7 +55,7 @@ fn main() {
         let arg = &args[i];
         
         if arg.starts_with('-') {
-            // GNU 风格选项
+            // GNU style options
             if arg.contains('c') || arg.contains('r') {
                 is_create_or_replace = true;
             }
@@ -63,7 +68,7 @@ fn main() {
                 continue;
             }
         } else if archive_file.is_none() {
-            // 第一个非选项参数
+            // First non-option argument
             let is_bsd_option = arg.chars().all(|c| c.is_ascii_lowercase()) 
                 && arg.len() <= 5 
                 && (arg.contains('c') || arg.contains('r'));
@@ -80,7 +85,7 @@ fn main() {
         i += 1;
     }
     
-    // 执行 ar/llvm-ar 命令
+    // Execute ar/llvm-ar command
     let status = Command::new(&ar_path)
         .args(&args[1..])
         .status()
@@ -90,12 +95,12 @@ fn main() {
         exit(status.code().unwrap_or(1));
     }
     
-    // 如果不是创建/替换操作，或者没有启用 LLVM IR 生成，直接退出
+    // If not create/replace operation, or LLVM IR generation not enabled, exit directly
     if !is_create_or_replace || !emit_llvmir {
         exit(0);
     }
     
-    // 查找与 .o 文件对应的 LLVM IR 文件
+    // Find LLVM IR files corresponding to .o files
     let mut llvm_ir_files: Vec<PathBuf> = Vec::new();
     
     for obj_file in &member_files {
@@ -115,7 +120,7 @@ fn main() {
         exit(0);
     }
     
-    // 获取 archive 文件的绝对路径
+    // Get absolute path of archive file
     let archive_path = match &archive_file {
         Some(path) => {
             if path.is_absolute() {
@@ -132,26 +137,26 @@ fn main() {
         }
     };
     
-    // 构建 llvm-link 输出路径
+    // Build llvm-link output path
     let mut llvm_link_output = PathBuf::from(&llvm_ir_dir);
     let rel_output = archive_path.strip_prefix("/")
         .unwrap_or(&archive_path);
     llvm_link_output.push(rel_output);
     
-    // 确保输出目录存在
+    // Ensure output directory exists
     if let Err(e) = ensure_dir_exists(&llvm_link_output) {
         eprintln!("Failed to create LLVM IR output directory: {}", e);
         exit(1);
     }
     
-    // 查找 llvm-link
-    // 优先使用 CC 或 CXX 环境变量来确定 llvm-link 版本
+    // Find llvm-link
+    // Prefer using CC or CXX environment variable to determine llvm-link version
     let clang_cmd_for_version = env::var("CC")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| env::var("CXX").ok().filter(|s| !s.is_empty()))
         .map(|s| {
-            // 从路径中提取文件名
+            // Extract filename from path
             PathBuf::from(&s)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -169,7 +174,7 @@ fn main() {
         llvm_link_output.display(),
         llvm_ir_files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(" ")));
     
-    // 构建 llvm-link 命令
+    // Build llvm-link command
     let mut llvm_link_cmd = Command::new(&llvm_link_path);
     llvm_link_cmd.arg("-o").arg(&llvm_link_output);
     
@@ -177,7 +182,7 @@ fn main() {
         llvm_link_cmd.arg(ir_file);
     }
     
-    // 创建日志文件
+    // Create log file
     let log_path = format!("{}_log", llvm_link_output.display());
     if let Err(e) = ensure_dir_exists(&PathBuf::from(&log_path)) {
         eprintln!("Failed to create log file directory: {}", e);
@@ -192,7 +197,7 @@ fn main() {
         }
     };
     
-    // 重定向 stdout 和 stderr 到日志文件
+    // Redirect stdout and stderr to log file
     llvm_link_cmd.stdout(Stdio::from(log_file.try_clone().unwrap()));
     llvm_link_cmd.stderr(Stdio::from(log_file));
     

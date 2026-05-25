@@ -1,6 +1,11 @@
-//! cp 包装器
+// SPDX-FileCopyrightText: (C) 2026 Institute of Software, Chinese Academy of Sciences (ISCAS)
+// SPDX-FileCopyrightText: (C) 2026 openRuyi Project Contributors
+// SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
+// SPDX-License-Identifier: MulanPSL-2.0
+
+//! cp wrapper
 //!
-//! 在执行 cp 命令后，同步复制 llvmir 目录中的对应文件
+//! After executing cp command, synchronously copy corresponding files in llvmir directory
 
 use std::env;
 use std::fs;
@@ -12,7 +17,7 @@ use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, is_debug_mode,
     compute_llvmir_path, compute_llvmir_target_dir, ensure_dir_exists,
     sync_llvmir_with_aux_files};
 
-/// 通用文件操作参数（适用于 cp/mv/ln）
+/// Common file operation parameters (for cp/mv/ln)
 pub struct FileOpArgs {
     pub sources: Vec<PathBuf>,
     pub destination: Option<PathBuf>,
@@ -20,7 +25,7 @@ pub struct FileOpArgs {
     pub other_args: Vec<String>,
 }
 
-/// 解析 cp 命令参数
+/// Parse cp command arguments
 fn parse_cp_args(args: &[String]) -> FileOpArgs {
     let mut result = FileOpArgs {
         sources: Vec::new(),
@@ -65,7 +70,7 @@ fn parse_cp_args(args: &[String]) -> FileOpArgs {
     result
 }
 
-/// 执行 cp 命令
+/// Execute cp command
 fn execute_cp(cp_path: &Path, args: &[String], debug: bool) -> i32 {
     debug_log(debug, &format!("[DEBUG] Executing cp: {} {}", cp_path.display(), args.join(" ")));
     
@@ -77,7 +82,7 @@ fn execute_cp(cp_path: &Path, args: &[String], debug: bool) -> i32 {
     status.code().unwrap_or(1)
 }
 
-/// 处理源文件的 llvmir 同步（复制到目标目录）
+/// Handle source file llvmir sync (copy to target directory)
 fn process_source_llvmir(
     cp_path: &Path,
     source: &Path,
@@ -100,7 +105,7 @@ fn process_source_llvmir(
         
         let llvmir_dest = llvmir_target_dir.join(source_name);
         
-        // 使用通用同步函数处理主文件和辅助文件
+        // Use common sync function to handle main file and auxiliary files
         sync_llvmir_with_aux_files(
             cp_path,
             "cp",
@@ -130,14 +135,14 @@ fn main() {
     let debug = is_debug_mode();
     let llvmir_dir = get_llvm_ir_dir();
     
-    // 先执行原始的 cp 命令
+    // First execute the original cp command
     let cp_result = execute_cp(&cp_path, &args[1..], debug);
     
     if cp_result != 0 {
         exit(cp_result);
     }
     
-    // 解析参数
+    // Parse arguments
     let parsed = parse_cp_args(&args[1..]);
     
     debug_log(debug, "[DEBUG] Parsed cp args:");
@@ -145,7 +150,7 @@ fn main() {
     debug_log(debug, &format!("[DEBUG]   destination: {:?}", parsed.destination));
     debug_log(debug, &format!("[DEBUG]   target_dir: {:?}", parsed.target_dir));
     
-    // 情况 1: 使用 -t DIRECTORY 指定目标目录
+    // Case 1: Use -t DIRECTORY to specify target directory
     if let Some(ref target_dir) = parsed.target_dir {
         for source in &parsed.sources {
             process_source_llvmir(&cp_path, source, target_dir, &parsed.other_args, &llvmir_dir, debug);
@@ -153,7 +158,7 @@ fn main() {
         exit(0);
     }
     
-    // 情况 2: 多个源文件，最后一个参数是目标目录
+    // Case 2: Multiple source files, last argument is target directory
     if parsed.sources.len() > 1 && parsed.destination.is_some() {
         let dest = parsed.destination.as_ref().unwrap();
         
@@ -165,7 +170,7 @@ fn main() {
         }
     }
     
-    // 情况 3: 单个源文件，有明确的目标
+    // Case 3: Single source file with explicit target
     if parsed.sources.len() == 1 {
         let source = &parsed.sources[0];
         

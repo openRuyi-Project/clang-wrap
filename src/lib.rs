@@ -1,11 +1,16 @@
-//! 公共库模块 - 提供 clang-wrap 工具的共享功能
+// SPDX-FileCopyrightText: (C) 2026 Institute of Software, Chinese Academy of Sciences (ISCAS)
+// SPDX-FileCopyrightText: (C) 2026 openRuyi Project Contributors
+// SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
+// SPDX-License-Identifier: MulanPSL-2.0
+
+//! Common library module - provides shared functionality for clang-wrap tools
 //!
-//! 包含以下公共功能：
-//! - 调试日志
-//! - PATH 中查找可执行文件
-//! - 环境变量读取
-//! - LLVM IR 路径计算
-//! - 查找相关文件（_log, _cmd, _verscript）
+//! Includes the following public features:
+//! - Debug logging
+//! - Finding executables in PATH
+//! - Environment variable reading
+//! - LLVM IR path calculation
+//! - Finding related files (_log, _cmd, _verscript)
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -14,24 +19,24 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 // ============================================================================
-// 调试日志功能
+// Debug logging functionality
 // ============================================================================
 
-/// 全局调试日志文件路径
+/// Global debug log file path
 pub static DEBUG_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// 初始化调试日志
-/// 如果启用了调试模式，设置日志文件路径
+/// Initialize debug logging
+/// If debug mode is enabled, set the log file path
 pub fn init_debug_log(llvmir_dir: &str) {
     let debug_log_path = PathBuf::from(llvmir_dir).join("clang-wrap-debug.log");
-    // 确保目录存在
+    // Ensure directory exists
     if let Some(parent) = debug_log_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let _ = DEBUG_LOG_PATH.set(debug_log_path);
 }
 
-/// 写入调试日志（如果启用了调试模式）
+/// Write to debug log (if debug mode is enabled)
 pub fn debug_log(debug_mode: bool, msg: &str) {
     if !debug_mode {
         return;
@@ -48,11 +53,11 @@ pub fn debug_log(debug_mode: bool, msg: &str) {
 }
 
 // ============================================================================
-// 环境变量读取
+// Environment variable reading
 // ============================================================================
 
-/// 获取 LLVM IR 输出目录
-/// 优先使用 LLVM_IR_DIR 环境变量，默认为 ~/tmp/llvmir
+/// Get LLVM IR output directory
+/// Prefer LLVM_IR_DIR environment variable, defaults to ~/tmp/llvmir
 pub fn get_llvm_ir_dir() -> String {
     env::var("LLVM_IR_DIR")
         .ok()
@@ -63,7 +68,7 @@ pub fn get_llvm_ir_dir() -> String {
         })
 }
 
-/// 检查是否启用调试模式
+/// Check if debug mode is enabled
 pub fn is_debug_mode() -> bool {
     env::var("CLANG_WRAP_DEBUG")
         .ok()
@@ -71,7 +76,7 @@ pub fn is_debug_mode() -> bool {
         .is_some()
 }
 
-/// 检查是否启用 LLVM IR 生成功能
+/// Check if LLVM IR generation is enabled
 pub fn is_emit_llvmir_enabled() -> bool {
     env::var("EMIT_LLVMIR")
         .ok()
@@ -79,7 +84,7 @@ pub fn is_emit_llvmir_enabled() -> bool {
         .is_some()
 }
 
-/// 获取 EMIT_LLVMIR 的值（可能包含额外选项）
+/// Get the value of EMIT_LLVMIR (may contain extra options)
 pub fn get_emit_llvmir_opt() -> Option<String> {
     env::var("EMIT_LLVMIR")
         .ok()
@@ -87,33 +92,33 @@ pub fn get_emit_llvmir_opt() -> Option<String> {
 }
 
 // ============================================================================
-// PATH 中查找可执行文件
+// Finding executables in PATH
 // ============================================================================
 
-/// 在 PATH 中查找指定的可执行文件，跳过当前可执行文件
-/// 返回找到的可执行文件的绝对路径
+/// Find the specified executable in PATH, skipping the current executable
+/// Returns the absolute path of the found executable
 pub fn find_exe_in_path(exe_name: &str, current_exe: &Path) -> Option<PathBuf> {
-    // 获取 PATH 环境变量
+    // Get PATH environment variable
     let path_env = env::var("PATH").ok()?;
     
-    // 解析当前可执行文件的真实路径（解析符号链接）
+    // Resolve the real path of the current executable (resolve symbolic links)
     let current_exe_real = current_exe.canonicalize().ok()?;
     
-    // 遍历 PATH 中的每个目录
+    // Iterate through each directory in PATH
     for dir in path_env.split(':') {
         let candidate = PathBuf::from(dir).join(exe_name);
         
-        // 检查文件是否存在且可执行
+        // Check if file exists and is executable
         if candidate.exists() {
-            // 解析候选文件的真实路径
+            // Resolve the real path of the candidate file
             if let Ok(candidate_real) = candidate.canonicalize() {
-                // 跳过自己（通过真实路径比较）
+                // Skip self (by comparing real paths)
                 if candidate_real == current_exe_real {
                     continue;
                 }
             }
             
-            // 找到了真正的可执行文件
+            // Found the real executable
             return Some(candidate);
         }
     }
@@ -121,36 +126,36 @@ pub fn find_exe_in_path(exe_name: &str, current_exe: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 获取要使用的可执行文件路径（跳过自己）
+/// Get the executable path to use (skip self)
 pub fn get_exe_path(exe_name: &str) -> PathBuf {
-    // 获取当前可执行文件的路径
+    // Get the current executable path
     match env::current_exe() {
         Ok(current_exe) => {
-            // 尝试在 PATH 中查找，跳过自己
+            // Try to find in PATH, skipping self
             match find_exe_in_path(exe_name, &current_exe) {
                 Some(path) => path,
                 None => {
-                    // 如果找不到，回退到直接使用名称（让系统在 PATH 中查找）
+                    // If not found, fall back to using name directly (let system find in PATH)
                     eprintln!("Warning: Could not find {} in PATH (skipping self)", exe_name);
                     PathBuf::from(exe_name)
                 }
             }
         }
         Err(_) => {
-            // 无法获取当前可执行文件路径，回退到直接使用名称
+            // Cannot get current executable path, fall back to using name directly
             PathBuf::from(exe_name)
         }
     }
 }
 
-/// 在 PATH 中查找 LLVM 工具
-/// 如果 clang_cmd 有版本后缀（如 clang-22），则优先查找带版本后缀的工具（如 llvm-link-22）
+/// Find LLVM tool in PATH
+/// If clang_cmd has a version suffix (e.g. clang-22), prefer finding tool with version suffix (e.g. llvm-link-22)
 pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
-    // 尝试从 clang_cmd 提取版本后缀
-    // 例如: clang-22 -> -22, clang++-22 -> -22
+    // Try to extract version suffix from clang_cmd
+    // e.g.: clang-22 -> -22, clang++-22 -> -22
     let version_suffix = if clang_cmd.starts_with("clang") {
-        let rest = &clang_cmd[5..]; // 跳过 "clang"
-        // 检查是否有版本后缀（以 - 或 + 开头）
+        let rest = &clang_cmd[5..]; // Skip "clang"
+        // Check if there's a version suffix (starting with - or +)
         if rest.starts_with('-') || rest.starts_with('+') {
             rest.to_string()
         } else if !rest.is_empty() && rest.chars().next().map(|c| c.is_numeric()).unwrap_or(false) {
@@ -163,7 +168,7 @@ pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
         String::new()
     };
     
-    // 如果有版本后缀，先尝试查找带版本后缀的工具
+    // If there's a version suffix, first try to find tool with version suffix
     if !version_suffix.is_empty() {
         let versioned_tool = format!("{}{}", tool_name, version_suffix);
         if let Ok(path_env) = env::var("PATH") {
@@ -176,7 +181,7 @@ pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
         }
     }
     
-    // 尝试查找不带版本后缀的工具
+    // Try to find tool without version suffix
     if let Ok(path_env) = env::var("PATH") {
         for dir in path_env.split(':') {
             let candidate = PathBuf::from(dir).join(tool_name);
@@ -186,15 +191,15 @@ pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
         }
     }
     
-    // 如果找不到，返回工具名称，让系统处理
+    // If not found, return tool name and let system handle it
     PathBuf::from(tool_name)
 }
 
 // ============================================================================
-// 路径处理工具
+// Path processing utilities
 // ============================================================================
 
-/// 获取路径的绝对路径
+/// Get the absolute path of a path
 pub fn get_absolute_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -205,8 +210,8 @@ pub fn get_absolute_path(path: &Path) -> PathBuf {
     }
 }
 
-/// 计算 llvmir 中路径（通用实现）
-/// 文件路径映射：llvmir_dir + 原始路径的绝对路径（去掉前导 /）
+/// Compute path in llvmir (generic implementation)
+/// File path mapping: llvmir_dir + absolute path of original path (remove leading /)
 pub fn compute_llvmir_path(path: &Path, llvmir_dir: &str) -> PathBuf {
     let abs_path = get_absolute_path(path);
     let mut ir_path = PathBuf::from(llvmir_dir);
@@ -214,27 +219,27 @@ pub fn compute_llvmir_path(path: &Path, llvmir_dir: &str) -> PathBuf {
     ir_path
 }
 
-/// 计算 llvmir 中目标目录的路径（别名，与 compute_llvmir_path 功能相同）
+/// Compute target directory path in llvmir (alias, same functionality as compute_llvmir_path)
 pub fn compute_llvmir_target_dir(target_dir: &Path, llvmir_dir: &str) -> PathBuf {
     compute_llvmir_path(target_dir, llvmir_dir)
 }
 
 // ============================================================================
-// 查找 LLVM IR 相关文件
+// Finding LLVM IR related files
 // ============================================================================
 
-/// 在 llvmir 目录中查找对应的 LLVM IR 文件
-/// 文件路径映射：llvmir_dir + 原始文件的绝对路径（去掉前导 /）
+/// Find corresponding LLVM IR file in llvmir directory
+/// File path mapping: llvmir_dir + absolute path of original file (remove leading /)
 pub fn find_llvmir_file(file_path: &Path, llvmir_dir: &str) -> Option<PathBuf> {
     find_llvmir_file_impl(file_path, llvmir_dir, false)
 }
 
-/// 在 llvmir 目录中查找对应的 LLVM IR 文件（带调试输出）
+/// Find corresponding LLVM IR file in llvmir directory (with debug output)
 pub fn find_llvmir_file_with_debug(file_path: &Path, llvmir_dir: &str, debug: bool) -> Option<PathBuf> {
     find_llvmir_file_impl(file_path, llvmir_dir, debug)
 }
 
-/// 查找 LLVM IR 文件的内部实现
+/// Internal implementation for finding LLVM IR files
 fn find_llvmir_file_impl(file_path: &Path, llvmir_dir: &str, debug: bool) -> Option<PathBuf> {
     debug_log(debug, &format!("[DEBUG] find_llvmir_file: looking for {:?}", file_path));
     
@@ -251,7 +256,7 @@ fn find_llvmir_file_impl(file_path: &Path, llvmir_dir: &str, debug: bool) -> Opt
         return Some(ir_path);
     }
     
-    // 检查 .bc 扩展名（LLVM bitcode）
+    // Check .bc extension (LLVM bitcode)
     debug_log(debug, &format!("[DEBUG]   Not found, trying .bc extension"));
     let ir_path_bc = ir_path.with_extension("bc");
     if ir_path_bc.exists() {
@@ -263,7 +268,7 @@ fn find_llvmir_file_impl(file_path: &Path, llvmir_dir: &str, debug: bool) -> Opt
     None
 }
 
-/// 辅助文件类型后缀
+/// Auxiliary file type suffix
 #[derive(Debug, Clone, Copy)]
 pub enum AuxFileSuffix {
     Log,
@@ -281,28 +286,28 @@ impl AuxFileSuffix {
     }
 }
 
-/// 查找对应的辅助文件（_log, _cmd, _verscript）
+/// Find corresponding auxiliary file (_log, _cmd, _verscript)
 pub fn find_aux_file(file_path: &Path, suffix: AuxFileSuffix) -> Option<PathBuf> {
     let aux_path = PathBuf::from(format!("{}{}", file_path.display(), suffix.as_str()));
     if aux_path.exists() { Some(aux_path) } else { None }
 }
 
-/// 查找对应的 _log 文件
+/// Find corresponding _log file
 pub fn find_log_file(file_path: &Path) -> Option<PathBuf> {
     find_aux_file(file_path, AuxFileSuffix::Log)
 }
 
-/// 查找对应的 _cmd 文件
+/// Find corresponding _cmd file
 pub fn find_cmd_file(file_path: &Path) -> Option<PathBuf> {
     find_aux_file(file_path, AuxFileSuffix::Cmd)
 }
 
-/// 查找对应的 _verscript 文件
+/// Find corresponding _verscript file
 pub fn find_verscript_file(file_path: &Path) -> Option<PathBuf> {
     find_aux_file(file_path, AuxFileSuffix::Verscript)
 }
 
-/// 查找所有相关的辅助文件（_log, _cmd, _verscript）
+/// Find all related auxiliary files (_log, _cmd, _verscript)
 pub fn find_all_aux_files(file_path: &Path) -> Vec<(AuxFileSuffix, PathBuf)> {
     [AuxFileSuffix::Log, AuxFileSuffix::Cmd, AuxFileSuffix::Verscript]
         .iter()
@@ -313,10 +318,10 @@ pub fn find_all_aux_files(file_path: &Path) -> Vec<(AuxFileSuffix, PathBuf)> {
 }
 
 // ============================================================================
-// 程序名处理
+// Program name handling
 // ============================================================================
 
-/// 从参数中获取程序名
+/// Get program name from arguments
 pub fn get_program_name(args: &[String]) -> &str {
     Path::new(&args[0])
         .file_name()
@@ -324,9 +329,9 @@ pub fn get_program_name(args: &[String]) -> &str {
         .unwrap_or("unknown")
 }
 
-/// 确定实际要调用的命令名
-/// 如果程序名是 xxx-wrap，则使用 xxx
-/// 否则使用实际的程序名
+/// Determine the actual command name to invoke
+/// If program name is xxx-wrap, use xxx
+/// Otherwise use the actual program name
 pub fn resolve_cmd_name<'a>(program_name: &'a str, wrap_suffix: &str, default_cmd: &'a str) -> &'a str {
     if program_name == wrap_suffix {
         default_cmd
@@ -336,10 +341,10 @@ pub fn resolve_cmd_name<'a>(program_name: &'a str, wrap_suffix: &str, default_cm
 }
 
 // ============================================================================
-// 文件操作工具
+// File operation utilities
 // ============================================================================
 
-/// 确保目录存在
+/// Ensure directory exists
 pub fn ensure_dir_exists(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -347,12 +352,12 @@ pub fn ensure_dir_exists(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 复制文件（用于 llvmir 目录）
+/// Copy file (for llvmir directory)
 pub fn copy_file(source: &Path, dest: &Path, debug: bool) -> i32 {
     debug_log(debug, &format!("[DEBUG] Copying llvmir file: {} -> {}", 
               source.display(), dest.display()));
     
-    // 确保目标目录存在
+    // Ensure destination directory exists
     if let Err(e) = ensure_dir_exists(dest) {
         eprintln!("Warning: Failed to create llvmir directory: {}", e);
         return 1;
@@ -368,8 +373,8 @@ pub fn copy_file(source: &Path, dest: &Path, debug: bool) -> i32 {
     }
 }
 
-/// 复制并修改 _cmd 文件内容
-/// 将源文件名替换为目标文件名
+/// Copy and modify _cmd file content
+/// Replace source file name with destination file name
 pub fn copy_and_modify_cmd_file(
     source: &Path,
     dest: &Path,
@@ -380,7 +385,7 @@ pub fn copy_and_modify_cmd_file(
     debug_log(debug, &format!("[DEBUG] Copying and modifying cmd file: {} -> {}", 
               source.display(), dest.display()));
     
-    // 读取源文件内容
+    // Read source file content
     let content = match fs::read_to_string(source) {
         Ok(c) => c,
         Err(e) => {
@@ -389,7 +394,7 @@ pub fn copy_and_modify_cmd_file(
         }
     };
     
-    // 替换文件名
+    // Replace file names
     let mut modified = content
         .replace(&format!("# Original output: {}", source_name), 
                  &format!("# Original output: {}", dest_name))
@@ -398,21 +403,21 @@ pub fn copy_and_modify_cmd_file(
         .replace(&format!("output/{}", source_name), 
                  &format!("output/{}", dest_name));
     
-    // 替换 _verscript 文件引用
+    // Replace _verscript file references
     modified = modified
         .replace(&format!("{}_verscript", source_name), 
                  &format!("{}_verscript", dest_name));
     
-    // 确保目标目录存在
+    // Ensure destination directory exists
     if let Err(e) = ensure_dir_exists(dest) {
         eprintln!("Warning: Failed to create llvmir directory: {}", e);
         return 1;
     }
     
-    // 写入目标文件
+    // Write to destination file
     match fs::write(dest, modified) {
         Ok(_) => {
-            // 复制可执行权限
+            // Copy executable permission
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -432,19 +437,19 @@ pub fn copy_and_modify_cmd_file(
 }
 
 // ============================================================================
-// 文件操作命令执行（用于 cp/mv/ln 的 llvmir 同步）
+// File operation command execution (for llvmir sync with cp/mv/ln)
 // ============================================================================
 
 use std::process::Command;
 
-/// 执行文件操作命令的通用实现（用于 llvmir 目录同步）
+/// Generic implementation for executing file operation commands (for llvmir directory sync)
 pub fn execute_file_cmd_for_llvmir(
     cmd_path: &Path,
-    cmd_name: &str,  // "cp", "mv", 或 "ln"
+    cmd_name: &str,  // "cp", "mv", or "ln"
     source: &Path,
     dest: &Path,
     other_args: &[String],
-    skip_args: &[&str],  // 需要跳过的参数前缀
+    skip_args: &[&str],  // Parameter prefixes to skip
     debug: bool,
 ) -> i32 {
     let mut args: Vec<String> = other_args.iter()
@@ -452,7 +457,7 @@ pub fn execute_file_cmd_for_llvmir(
         .cloned()
         .collect();
     
-    // ln 命令需要计算相对路径
+    // ln command needs to calculate relative path
     if cmd_name == "ln" {
         let link_dir = dest.parent().unwrap_or(Path::new("."));
         let relative_source = pathdiff::diff_paths(source, link_dir)
@@ -475,7 +480,7 @@ pub fn execute_file_cmd_for_llvmir(
     }
 }
 
-/// 同步复制/移动 llvmir 文件及其辅助文件（_log, _cmd, _verscript）
+/// Sync copy/move llvmir files and their auxiliary files (_log, _cmd, _verscript)
 pub fn sync_llvmir_with_aux_files(
     cmd_path: &Path,
     cmd_name: &str,
@@ -485,10 +490,10 @@ pub fn sync_llvmir_with_aux_files(
     skip_args: &[&str],
     debug: bool,
 ) {
-    // 执行主文件操作
+    // Execute main file operation
     execute_file_cmd_for_llvmir(cmd_path, cmd_name, llvmir_source, llvmir_dest, other_args, skip_args, debug);
     
-    // 同步辅助文件
+    // Sync auxiliary files
     for (suffix, aux_source) in find_all_aux_files(llvmir_source) {
         let aux_dest = PathBuf::from(format!("{}{}", llvmir_dest.display(), suffix.as_str()));
         debug_log(debug, &format!("[DEBUG] Syncing aux file: {} -> {}", 
@@ -498,12 +503,12 @@ pub fn sync_llvmir_with_aux_files(
 }
 
 // ============================================================================
-// 时间戳生成
+// Timestamp generation
 // ============================================================================
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 生成临时文件后缀，基于时间戳和进程 ID
+/// Generate temporary file suffix based on timestamp and process ID
 pub fn generate_tmp_suffix() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -513,27 +518,27 @@ pub fn generate_tmp_suffix() -> String {
     format!(".tmp.{}.{}", pid, timestamp)
 }
 
-/// 为路径添加临时文件后缀
+/// Append temporary file suffix to path
 pub fn append_tmp_suffix(path: &Path, suffix: &str) -> PathBuf {
     let path_str = path.to_string_lossy();
     PathBuf::from(format!("{}{}", path_str, suffix))
 }
 
 // ============================================================================
-// Shell 转义
+// Shell escaping
 // ============================================================================
 
-/// 对 shell 参数进行转义
+/// Escape shell argument
 pub fn shell_escape(s: &str) -> String {
-    // 如果字符串包含特殊字符，用单引号包围
+    // If string contains special characters, wrap with single quotes
     if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains('\\') 
        || s.contains('$') || s.contains('`') || s.contains('!') || s.contains('*')
        || s.contains('?') || s.contains('[') || s.contains(']') || s.contains('(')
        || s.contains(')') || s.contains('{') || s.contains('}') || s.contains('|')
        || s.contains('&') || s.contains(';') || s.contains('<') || s.contains('>')
        || s.contains('~') {
-        // 单引号内除了单引号本身外都是字面量
-        // 单引号需要用 '\'' 来表示
+        // Inside single quotes everything is literal except single quote itself
+        // Single quote needs to be represented with '\''
         format!("'{}'", s.replace("'", "'\\''"))
     } else {
         s.to_string()
@@ -541,22 +546,22 @@ pub fn shell_escape(s: &str) -> String {
 }
 
 // ============================================================================
-// @file 参数展开
+// @file argument expansion
 // ============================================================================
 
 use std::io::{BufRead, BufReader};
 
-/// 展开 @file 参数
-/// @file 语法用于从文件中读取参数，每行一个参数
+/// Expand @file arguments
+/// @file syntax reads arguments from file, one per line
 pub fn expand_at_file_args(args: &[String], debug_mode: bool) -> Vec<String> {
     let mut expanded_args: Vec<String> = Vec::new();
     
     for arg in args {
         if arg.starts_with('@') {
-            // 获取文件路径（去掉 @ 前缀）
+            // Get file path (remove @ prefix)
             let file_path = &arg[1..];
             
-            // 尝试打开并读取文件
+            // Try to open and read the file
             match File::open(file_path) {
                 Ok(file) => {
                     let reader = BufReader::new(file);
@@ -565,10 +570,10 @@ pub fn expand_at_file_args(args: &[String], debug_mode: bool) -> Vec<String> {
                     for line in reader.lines() {
                         match line {
                             Ok(l) => {
-                                // 去掉首尾空白字符
+                                // Trim leading and trailing whitespace
                                 let trimmed = l.trim();
                                 if !trimmed.is_empty() {
-                                    // 按空白字符分割，支持一行多个参数的情况
+                                    // Split by whitespace, supporting multiple arguments per line
                                     for part in trimmed.split_whitespace() {
                                         expanded_args.push(part.to_string());
                                         lines_read += 1;
@@ -585,7 +590,7 @@ pub fn expand_at_file_args(args: &[String], debug_mode: bool) -> Vec<String> {
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to open @file '{}': {}", file_path, e);
-                    // 如果文件不存在，保留原始参数
+                    // If file doesn't exist, keep original argument
                     expanded_args.push(arg.clone());
                 }
             }
