@@ -239,6 +239,24 @@ test_libpcap() {
 	cd -
 }
 
+test_gsl() {
+	pkg=gsl
+	export CLANG_WRAP_DEBUG=1
+	#export EMIT_LLVMIR="-march=native"
+	export EMIT_LLVMIR=-march=native
+	export PATH=`pwd`/clang-wrap-install/bin:$PATH
+	mkdir -p testdeb/$pkg
+	cd testdeb/$pkg && rm -rf ${pkg}*
+	apt-get source $pkg
+	cd ${pkg}-*
+	rm -rf ~/tmp/llvmir/`pwd`
+	AUTOMAKE=automake ACLOCAL=aclocal dh_autoreconf
+	CC=clang CXX=clang++ ./configure && make V=1 && make install DESTDIR=`pwd`/install
+	(cd install/usr/local/lib/llvmir && bash *_cmd)
+	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
+	cd -
+}
+
 # 显示帮助信息
 show_help() {
 	echo "用法: $0 [命令]"
@@ -257,6 +275,7 @@ show_help() {
 	echo "  ffmpeg       - 测试 ffmpeg 包"
 	echo "  sqlite3      - 测试 sqlite3 包"
 	echo "  libpcap      - 测试 libpcap 包"
+	echo "  gsl          - 测试 gsl 包"
 	echo "  all          - 构建并测试所有包"
 	echo "  help         - 显示此帮助信息"
 	echo ""
@@ -305,6 +324,9 @@ main() {
 		libpcap)
 			test_libpcap
 			;;
+		gsl)
+			test_gsl
+			;;
 		all)
 			build
 			test_libxml2
@@ -319,6 +341,7 @@ main() {
 			test_ffmpeg
 			test_sqlite3
 			test_libpcap
+			test_gsl
 			;;
 		help|-h|--help)
 			show_help

@@ -17,7 +17,10 @@ use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, is_debug_mode,
 
 /// Parse install command arguments
 struct InstallArgs {
+    /// -d or --directory: treat all arguments as directory names, create them
     create_dirs: bool,
+    /// -D: create leading components of dest, then copy source to dest
+    create_leading: bool,
     target_dir: Option<PathBuf>,
     sources: Vec<PathBuf>,
     destination: Option<PathBuf>,
@@ -29,6 +32,7 @@ struct InstallArgs {
 fn parse_install_args(args: &[String]) -> InstallArgs {
     let mut result = InstallArgs {
         create_dirs: false,
+        create_leading: false,
         target_dir: None,
         sources: Vec::new(),
         destination: None,
@@ -45,6 +49,10 @@ fn parse_install_args(args: &[String]) -> InstallArgs {
         
         if arg == "-d" || arg == "--directory" {
             result.create_dirs = true;
+            result.other_args.push(arg.clone());
+        } else if arg == "-D" {
+            // -D: create leading components of dest, then copy source to dest
+            result.create_leading = true;
             result.other_args.push(arg.clone());
         } else if arg == "-t" {
             if i + 1 < n {
@@ -310,29 +318,59 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Determine LLVM IR install target directory
-fn get_llvmir_install_dir(dest_dir: &Path, is_shared: bool, is_exec: bool) -> PathBuf {
-    let dest_str = dest_dir.to_string_lossy();
+///
+/// When dest is a file path (e.g., installing libfoo.so to /usr/lib/libfoo.so.1.2.3),
+/// use the parent directory. When dest is a directory, use it directly.
+///
+/// Note on install command options:
+/// - `-d` or `--directory`: treat all arguments as directory names, create them (no file copy)
+/// - `-D`: create leading components of dest (parent dirs), then copy source to dest as a file
+/// - Without `-d` or `-D`:
+///   - If dest exists and is a directory → dest is a directory
+///   - If dest does not exist → dest is a file (install will create it as a file)
+///   - If dest exists and is a file → dest is a file
+fn get_llvmir_install_dir(dest: &Path, is_shared: bool, is_exec: bool) -> PathBuf {
+    // Determine if dest is a file or directory
+    // After install command executes:
+    // - If dest exists: check if it's file or directory
+    // - If dest doesn't exist yet (shouldn't happen after install): treat as file
+    let dest_is_file = if dest.exists() {
+        dest.is_file()
+    } else {
+        // If dest doesn't exist yet, install will create it as a file
+        // (not a directory, since -d mode is handled separately and exits early)
+        true
+    };
+    
+    // Get the actual directory to use
+    let actual_dir = if dest_is_file {
+        dest.parent().unwrap_or(dest)
+    } else {
+        dest
+    };
+    
+    let actual_dir_str = actual_dir.to_string_lossy();
     
     if is_shared {
-        if dest_str.contains("/lib/") {
-            if let Some(idx) = dest_str.find("/lib/") {
-                let prefix = &dest_str[..idx + 4];
+        if actual_dir_str.contains("/lib/") {
+            if let Some(idx) = actual_dir_str.find("/lib/") {
+                let prefix = &actual_dir_str[..idx + 4];
                 return PathBuf::from(format!("{}/llvmir", prefix));
             }
         }
-        dest_dir.join("llvmir")
+        actual_dir.join("llvmir")
     } else if is_exec {
-        if dest_str.contains("/bin/") {
-            if let Some(idx) = dest_str.find("/bin/") {
-                let prefix = &dest_str[..idx];
+        if actual_dir_str.contains("/bin/") {
+            if let Some(idx) = actual_dir_str.find("/bin/") {
+                let prefix = &actual_dir_str[..idx];
                 return PathBuf::from(format!("{}/lib/llvmir-bin", prefix));
             }
         }
-        dest_dir.parent()
+        actual_dir.parent()
             .map(|p| p.join("lib").join("llvmir-bin"))
-            .unwrap_or_else(|| dest_dir.join("llvmir-bin"))
+            .unwrap_or_else(|| actual_dir.join("llvmir-bin"))
     } else {
-        dest_dir.join("llvmir")
+        actual_dir.join("llvmir")
     }
 }
 
