@@ -1008,10 +1008,14 @@ fn main() {
             }
             exit(0);
         }
-        Ok(_status) => {
-            debug_log(debug_mode, &format!("[DEBUG] Warning: LLVM IR generation failed, see {} for details", log_path));
+        Ok(status) => {
+            debug_log(debug_mode, &format!("[DEBUG] LLVM IR generation failed, see {} for details", log_path));
             let _ = fs::remove_file(&ir_output_path);
-            exit(0);
+            // Remove the normal .o file as well since LLVM IR generation failed
+            if output_path.exists() {
+                let _ = fs::remove_file(&output_path);
+            }
+            exit(status.code().unwrap_or(1));
         }
         Err(e) => {
             debug_log(debug_mode, &format!("[DEBUG] Warning: Failed to execute LLVM IR generation: {}", e));
