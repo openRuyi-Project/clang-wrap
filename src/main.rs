@@ -3,9 +3,9 @@
 // SPDX-FileContributor: YunQiang Su <yunqiang@isrc.iscas.ac.cn>
 // SPDX-License-Identifier: MulanPSL-2.0
 
-//! clang/clang++ 包装器
+//! clang/clang++ wrapper
 //!
-//! 在编译时生成 LLVM IR，在链接时使用 llvm-link 合并 LLVM IR 文件
+//! Generates LLVM IR during compilation, merges LLVM IR files using llvm-link during linking
 
 use std::env;
 use std::fs::{self, File};
@@ -19,13 +19,13 @@ use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, is_debug_mode,
     shell_escape, expand_at_file_args, init_debug_log};
 
 // ============================================================================
-// 常量定义
+// Constant definitions
 // ============================================================================
 
-/// 源文件扩展名
+/// Source file extensions
 const SOURCE_EXTENSIONS: &[&str] = &[".c", ".cpp", ".cc", ".cxx", ".c++", ".m", ".mm", ".S", ".s", ".asm"];
 
-/// 获取 clang 版本信息
+/// Get clang version information
 fn get_clang_version(clang_path: &Path) -> Option<String> {
     let output = Command::new(clang_path)
         .arg("--version")
@@ -41,7 +41,42 @@ fn get_clang_version(clang_path: &Path) -> Option<String> {
     None
 }
 
-/// 处理链接命令（生成可执行程序或共享库）
+/// Get target architecture through full compilation command
+/// Run with --version appended to the full compilation command, parse the Target line in output
+fn get_compile_target(clang_path: &Path, args: &[String]) -> Option<String> {
+    let mut cmd = Command::new(clang_path);
+    cmd.args(args);
+    cmd.arg("--version");
+    
+    let output = cmd.output().ok()?;
+    
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.starts_with("Target:") {
+                let target = line["Target:".len()..].trim();
+                return Some(target.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Return corresponding -march option based on target architecture
+fn get_march_for_target(target: &str) -> Option<&'static str> {
+    // Detect riscv64
+    if target.starts_with("riscv64") || target.contains("riscv64") {
+        return Some("-march=rva23u64");
+    }
+    // Detect x86-64 (including x86_64)
+    if target.starts_with("x86_64") || target.starts_with("x86-64") 
+        || target.contains("x86_64") || target.contains("x86-64") {
+        return Some("-march=x86-64-v4");
+    }
+    None
+}
+
+/// Handle link command (generate executable or shared library)
 fn handle_link_command(
     clang_path: &Path,
     args: &[String],
@@ -49,7 +84,7 @@ fn handle_link_command(
     _emit_llvmir_opt: Option<&str>,
     debug_mode: bool,
 ) -> ! {
-    // 解析参数
+    // Parse arguments
     let mut object_files: Vec<PathBuf> = Vec::new();
     let mut source_files: Vec<PathBuf> = Vec::new();
     let mut library_files: Vec<PathBuf> = Vec::new();
@@ -163,7 +198,7 @@ fn handle_link_command(
         None => PathBuf::from("a.out"),
     };
 
-    // 第一遍：正常链接
+    // First pass: normal linking
     debug_log(debug_mode, &format!("[DEBUG] Normal linking: {} {}", clang_path.display(), args[1..].join(" ")));
     
     let status = Command::new(clang_path)
@@ -175,12 +210,12 @@ fn handle_link_command(
         exit(status.code().unwrap_or(1));
     }
 
-    // 第二遍：使用 llvm-link 链接 LLVM IR 文件
+    // Second pass: use llvm-link to merge LLVM IR files
     let mut llvm_ir_files: Vec<PathBuf> = Vec::new();
     let mut temp_llvm_ir_files: Vec<PathBuf> = Vec::new();
     let mut merged_static_lib_paths: Vec<PathBuf> = Vec::new();
     
-    // 1. 查找与 .o 文件对应的 LLVM IR 文件
+    // 1. Find LLVM IR files corresponding to .o files
     for obj_file in &object_files {
         let abs_obj = get_absolute_path(obj_file);
         
@@ -196,7 +231,7 @@ fn handle_link_command(
         }
     }
     
-    // 1.5 查找与静态库对应的 LLVM IR 文件
+    // 1.5 Find LLVM IR files corresponding to static libraries
     for lib_file in &library_files {
         if !lib_file.extension().map(|e| e == "a").unwrap_or(false) {
             continue;
@@ -218,7 +253,16 @@ fn handle_link_command(
         }
     }
     
-    // 2. 为源文件生成 LLVM IR
+    // Get target architecture and determine if -march option needs to be added
+    // Use full compilation command to get target architecture
+    let march_opt = get_compile_target(clang_path, &args[1..])
+        .and_then(|target| get_march_for_target(&target));
+    
+    if let Some(march) = march_opt {
+        debug_log(debug_mode, &format!("[DEBUG] Adding march option for LLVM IR generation in link command: {}", march));
+    }
+    
+    // 2. Generate LLVM IR for source files
     for source_file in &source_files {
         let abs_source = get_absolute_path(source_file);
         
@@ -238,6 +282,12 @@ fn handle_link_command(
         
         let mut llvm_gen_cmd = Command::new(clang_path);
         llvm_gen_cmd.args(&other_args);
+        
+        // Add -march option (if detected as needed)
+        if let Some(march) = march_opt {
+            llvm_gen_cmd.arg(march);
+        }
+        
         llvm_gen_cmd.arg("-emit-llvm");
         llvm_gen_cmd.arg("-c");
         llvm_gen_cmd.arg(source_file);
@@ -246,6 +296,9 @@ fn handle_link_command(
         {
             let mut cmd_parts = vec![clang_path.display().to_string()];
             cmd_parts.extend(other_args.clone());
+            if let Some(march) = march_opt {
+                cmd_parts.push(march.to_string());
+            }
             cmd_parts.push("-emit-llvm".to_string());
             cmd_parts.push("-c".to_string());
             cmd_parts.push(source_file.display().to_string());
@@ -420,7 +473,7 @@ fn handle_link_command(
     }
 }
 
-/// 生成链接命令脚本 (_cmd 文件)
+/// Generate link command script (_cmd file)
 fn generate_link_cmd_file(
     clang_path: &Path,
     llvm_link_output: &Path,
@@ -722,10 +775,10 @@ fn generate_link_cmd_file(
 fn main() {
     let original_args: Vec<String> = env::args().collect();
     
-    // 获取程序名
+    // Get program name
     let program_name = get_program_name(&original_args);
     
-    // 确定实际要调用的 clang 可执行文件
+    // Determine the actual clang executable to invoke
     let clang_cmd = if program_name == "clang-wrap" {
         "clang"
     } else if program_name == "clangxx" {
@@ -734,7 +787,7 @@ fn main() {
         program_name
     };
     
-    // 获取真正的 clang 路径（跳过自己）
+    // Get the real clang path (skip self)
     let clang_path = get_exe_path(clang_cmd);
     
     if original_args.len() < 2 {
@@ -752,12 +805,12 @@ fn main() {
     
     let llvm_ir_dir = get_llvm_ir_dir();
     
-    // 初始化调试日志
+    // Initialize debug log
     if debug_mode {
         init_debug_log(&llvm_ir_dir);
     }
 
-    // 检查是否有 -c 选项和 -E 选项
+    // Check for -c and -E options
     let compile_flag_pos = args.iter().position(|arg| arg == "-c");
     let preprocess_flag_pos = args.iter().position(|arg| arg == "-E");
     
@@ -812,7 +865,7 @@ fn main() {
         handle_link_command(&clang_path, &args, &llvm_ir_dir, emit_llvmir_opt.as_deref(), debug_mode);
     }
 
-    // 解析编译参数
+    // Parse compilation arguments
     let mut input_file: Option<PathBuf> = None;
     let mut output_file: Option<PathBuf> = None;
     let mut other_args: Vec<String> = Vec::new();
@@ -874,7 +927,7 @@ fn main() {
         }
     };
 
-    // 第一遍：正常编译
+    // First pass: normal compilation
     let mut normal_cmd = Command::new(&clang_path);
     normal_cmd.args(&args[1..]);
     
@@ -891,7 +944,7 @@ fn main() {
         }
     }
 
-    // 第二遍：生成 LLVM IR
+    // Second pass: generate LLVM IR
     if emit_llvmir_opt.is_none() {
         exit(0);
     }
@@ -906,11 +959,25 @@ fn main() {
         Vec::new()
     };
     
+    // Get target architecture and determine if -march option needs to be added
+    // Use full compilation command to get target architecture
+    let march_opt = get_compile_target(&clang_path, &args[1..])
+        .and_then(|target| get_march_for_target(&target));
+    
+    if let Some(march) = march_opt {
+        debug_log(debug_mode, &format!("[DEBUG] Adding march option for LLVM IR generation: {}", march));
+    }
+    
     let mut llvm_cmd = Command::new(&clang_path);
     llvm_cmd.args(&other_args);
     
     for opt in &extra_opts {
         llvm_cmd.arg(opt);
+    }
+    
+    // Add -march option (if detected as needed)
+    if let Some(march) = march_opt {
+        llvm_cmd.arg(march);
     }
     
     llvm_cmd.arg("-emit-llvm");
@@ -948,6 +1015,9 @@ fn main() {
         let mut cmd_args: Vec<String> = other_args.clone();
         for opt in &extra_opts {
             cmd_args.push(opt.clone());
+        }
+        if let Some(march) = march_opt {
+            cmd_args.push(march.to_string());
         }
         cmd_args.push("-emit-llvm".to_string());
         if let Some(ref input) = input_file {
