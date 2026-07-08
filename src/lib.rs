@@ -13,7 +13,7 @@
 //! - Finding related files (_log, _cmd, _verscript)
 
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -42,11 +42,7 @@ pub fn debug_log(debug_mode: bool, msg: &str) {
         return;
     }
     if let Some(log_path) = DEBUG_LOG_PATH.get() {
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
             let _ = writeln!(file, "{}", msg);
         }
     }
@@ -100,14 +96,14 @@ pub fn get_emit_llvmir_opt() -> Option<String> {
 pub fn find_exe_in_path(exe_name: &str, current_exe: &Path) -> Option<PathBuf> {
     // Get PATH environment variable
     let path_env = env::var("PATH").ok()?;
-    
+
     // Resolve the real path of the current executable (resolve symbolic links)
     let current_exe_real = current_exe.canonicalize().ok()?;
-    
+
     // Iterate through each directory in PATH
     for dir in path_env.split(':') {
         let candidate = PathBuf::from(dir).join(exe_name);
-        
+
         // Check if file exists and is executable
         if candidate.exists() {
             // Resolve the real path of the candidate file
@@ -117,12 +113,12 @@ pub fn find_exe_in_path(exe_name: &str, current_exe: &Path) -> Option<PathBuf> {
                     continue;
                 }
             }
-            
+
             // Found the real executable
             return Some(candidate);
         }
     }
-    
+
     None
 }
 
@@ -136,7 +132,10 @@ pub fn get_exe_path(exe_name: &str) -> PathBuf {
                 Some(path) => path,
                 None => {
                     // If not found, fall back to using name directly (let system find in PATH)
-                    eprintln!("Warning: Could not find {} in PATH (skipping self)", exe_name);
+                    eprintln!(
+                        "Warning: Could not find {} in PATH (skipping self)",
+                        exe_name
+                    );
                     PathBuf::from(exe_name)
                 }
             }
@@ -153,8 +152,7 @@ pub fn get_exe_path(exe_name: &str) -> PathBuf {
 pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
     // Try to extract version suffix from clang_cmd
     // e.g.: clang-22 -> -22, clang++-22 -> -22
-    let version_suffix = if clang_cmd.starts_with("clang") {
-        let rest = &clang_cmd[5..]; // Skip "clang"
+    let version_suffix = if let Some(rest) = clang_cmd.strip_prefix("clang") {
         // Check if there's a version suffix (starting with - or +)
         if rest.starts_with('-') || rest.starts_with('+') {
             rest.to_string()
@@ -167,7 +165,7 @@ pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
     } else {
         String::new()
     };
-    
+
     // If there's a version suffix, first try to find tool with version suffix
     if !version_suffix.is_empty() {
         let versioned_tool = format!("{}{}", tool_name, version_suffix);
@@ -180,7 +178,7 @@ pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
             }
         }
     }
-    
+
     // Try to find tool without version suffix
     if let Ok(path_env) = env::var("PATH") {
         for dir in path_env.split(':') {
@@ -190,7 +188,7 @@ pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
             }
         }
     }
-    
+
     // If not found, return tool name and let system handle it
     PathBuf::from(tool_name)
 }
@@ -235,35 +233,42 @@ pub fn find_llvmir_file(file_path: &Path, llvmir_dir: &str) -> Option<PathBuf> {
 }
 
 /// Find corresponding LLVM IR file in llvmir directory (with debug output)
-pub fn find_llvmir_file_with_debug(file_path: &Path, llvmir_dir: &str, debug: bool) -> Option<PathBuf> {
+pub fn find_llvmir_file_with_debug(
+    file_path: &Path,
+    llvmir_dir: &str,
+    debug: bool,
+) -> Option<PathBuf> {
     find_llvmir_file_impl(file_path, llvmir_dir, debug)
 }
 
 /// Internal implementation for finding LLVM IR files
 fn find_llvmir_file_impl(file_path: &Path, llvmir_dir: &str, debug: bool) -> Option<PathBuf> {
-    debug_log(debug, &format!("[DEBUG] find_llvmir_file: looking for {:?}", file_path));
-    
+    debug_log(
+        debug,
+        &format!("[DEBUG] find_llvmir_file: looking for {:?}", file_path),
+    );
+
     let abs_path = get_absolute_path(file_path);
     debug_log(debug, &format!("[DEBUG]   absolute path: {:?}", abs_path));
-    
+
     let mut ir_path = PathBuf::from(llvmir_dir);
     let rel_path = abs_path.strip_prefix("/").unwrap_or(&abs_path);
     ir_path.push(rel_path);
     debug_log(debug, &format!("[DEBUG]   llvmir path: {:?}", ir_path));
-    
+
     if ir_path.exists() {
         debug_log(debug, &format!("[DEBUG]   Found at: {:?}", ir_path));
         return Some(ir_path);
     }
-    
+
     // Check .bc extension (LLVM bitcode)
-    debug_log(debug, &format!("[DEBUG]   Not found, trying .bc extension"));
+    debug_log(debug, "[DEBUG]   Not found, trying .bc extension");
     let ir_path_bc = ir_path.with_extension("bc");
     if ir_path_bc.exists() {
         debug_log(debug, &format!("[DEBUG]   Found at: {:?}", ir_path_bc));
         return Some(ir_path_bc);
     }
-    
+
     debug_log(debug, "[DEBUG]   Not found");
     None
 }
@@ -289,7 +294,11 @@ impl AuxFileSuffix {
 /// Find corresponding auxiliary file (_log, _cmd, _verscript)
 pub fn find_aux_file(file_path: &Path, suffix: AuxFileSuffix) -> Option<PathBuf> {
     let aux_path = PathBuf::from(format!("{}{}", file_path.display(), suffix.as_str()));
-    if aux_path.exists() { Some(aux_path) } else { None }
+    if aux_path.exists() {
+        Some(aux_path)
+    } else {
+        None
+    }
 }
 
 /// Find corresponding _log file
@@ -309,12 +318,14 @@ pub fn find_verscript_file(file_path: &Path) -> Option<PathBuf> {
 
 /// Find all related auxiliary files (_log, _cmd, _verscript)
 pub fn find_all_aux_files(file_path: &Path) -> Vec<(AuxFileSuffix, PathBuf)> {
-    [AuxFileSuffix::Log, AuxFileSuffix::Cmd, AuxFileSuffix::Verscript]
-        .iter()
-        .filter_map(|&suffix| {
-            find_aux_file(file_path, suffix).map(|p| (suffix, p))
-        })
-        .collect()
+    [
+        AuxFileSuffix::Log,
+        AuxFileSuffix::Cmd,
+        AuxFileSuffix::Verscript,
+    ]
+    .iter()
+    .filter_map(|&suffix| find_aux_file(file_path, suffix).map(|p| (suffix, p)))
+    .collect()
 }
 
 // ============================================================================
@@ -332,7 +343,11 @@ pub fn get_program_name(args: &[String]) -> &str {
 /// Determine the actual command name to invoke
 /// If program name is xxx-wrap, use xxx
 /// Otherwise use the actual program name
-pub fn resolve_cmd_name<'a>(program_name: &'a str, wrap_suffix: &str, default_cmd: &'a str) -> &'a str {
+pub fn resolve_cmd_name<'a>(
+    program_name: &'a str,
+    wrap_suffix: &str,
+    default_cmd: &'a str,
+) -> &'a str {
     if program_name == wrap_suffix {
         default_cmd
     } else {
@@ -354,20 +369,30 @@ pub fn ensure_dir_exists(path: &Path) -> std::io::Result<()> {
 
 /// Copy file (for llvmir directory)
 pub fn copy_file(source: &Path, dest: &Path, debug: bool) -> i32 {
-    debug_log(debug, &format!("[DEBUG] Copying llvmir file: {} -> {}", 
-              source.display(), dest.display()));
-    
+    debug_log(
+        debug,
+        &format!(
+            "[DEBUG] Copying llvmir file: {} -> {}",
+            source.display(),
+            dest.display()
+        ),
+    );
+
     // Ensure destination directory exists
     if let Err(e) = ensure_dir_exists(dest) {
         eprintln!("Warning: Failed to create llvmir directory: {}", e);
         return 1;
     }
-    
+
     match fs::copy(source, dest) {
         Ok(_) => 0,
         Err(e) => {
-            eprintln!("Warning: Failed to copy {} to {}: {}", 
-                      source.display(), dest.display(), e);
+            eprintln!(
+                "Warning: Failed to copy {} to {}: {}",
+                source.display(),
+                dest.display(),
+                e
+            );
             1
         }
     }
@@ -382,38 +407,52 @@ pub fn copy_and_modify_cmd_file(
     dest_name: &str,
     debug: bool,
 ) -> i32 {
-    debug_log(debug, &format!("[DEBUG] Copying and modifying cmd file: {} -> {}", 
-              source.display(), dest.display()));
-    
+    debug_log(
+        debug,
+        &format!(
+            "[DEBUG] Copying and modifying cmd file: {} -> {}",
+            source.display(),
+            dest.display()
+        ),
+    );
+
     // Read source file content
     let content = match fs::read_to_string(source) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Warning: Failed to read cmd file {}: {}", source.display(), e);
+            eprintln!(
+                "Warning: Failed to read cmd file {}: {}",
+                source.display(),
+                e
+            );
             return 1;
         }
     };
-    
+
     // Replace file names
     let mut modified = content
-        .replace(&format!("# Original output: {}", source_name), 
-                 &format!("# Original output: {}", dest_name))
-        .replace(&format!("./{}", source_name), 
-                 &format!("./{}", dest_name))
-        .replace(&format!("output/{}", source_name), 
-                 &format!("output/{}", dest_name));
-    
+        .replace(
+            &format!("# Original output: {}", source_name),
+            &format!("# Original output: {}", dest_name),
+        )
+        .replace(&format!("./{}", source_name), &format!("./{}", dest_name))
+        .replace(
+            &format!("output/{}", source_name),
+            &format!("output/{}", dest_name),
+        );
+
     // Replace _verscript file references
-    modified = modified
-        .replace(&format!("{}_verscript", source_name), 
-                 &format!("{}_verscript", dest_name));
-    
+    modified = modified.replace(
+        &format!("{}_verscript", source_name),
+        &format!("{}_verscript", dest_name),
+    );
+
     // Ensure destination directory exists
     if let Err(e) = ensure_dir_exists(dest) {
         eprintln!("Warning: Failed to create llvmir directory: {}", e);
         return 1;
     }
-    
+
     // Write to destination file
     match fs::write(dest, modified) {
         Ok(_) => {
@@ -430,7 +469,11 @@ pub fn copy_and_modify_cmd_file(
             0
         }
         Err(e) => {
-            eprintln!("Warning: Failed to write cmd file {}: {}", dest.display(), e);
+            eprintln!(
+                "Warning: Failed to write cmd file {}: {}",
+                dest.display(),
+                e
+            );
             1
         }
     }
@@ -445,32 +488,48 @@ use std::process::Command;
 /// Generic implementation for executing file operation commands (for llvmir directory sync)
 pub fn execute_file_cmd_for_llvmir(
     cmd_path: &Path,
-    cmd_name: &str,  // "cp", "mv", or "ln"
+    cmd_name: &str, // "cp", "mv", or "ln"
     source: &Path,
     dest: &Path,
     other_args: &[String],
-    skip_args: &[&str],  // Parameter prefixes to skip
+    skip_args: &[&str], // Parameter prefixes to skip
     debug: bool,
 ) -> i32 {
-    let mut args: Vec<String> = other_args.iter()
+    let mut args: Vec<String> = other_args
+        .iter()
         .filter(|arg| !skip_args.iter().any(|skip| arg.starts_with(skip)))
         .cloned()
         .collect();
-    
-    // ln command needs to calculate relative path
-    if cmd_name == "ln" {
+
+    let symbolic_link = cmd_name == "ln"
+        && other_args.iter().any(|arg| {
+            arg == "--symbolic"
+                || arg
+                    .strip_prefix('-')
+                    .filter(|rest| !rest.starts_with('-'))
+                    .is_some_and(|rest| rest.contains('s'))
+        });
+
+    if symbolic_link {
         let link_dir = dest.parent().unwrap_or(Path::new("."));
-        let relative_source = pathdiff::diff_paths(source, link_dir)
-            .unwrap_or_else(|| source.to_path_buf());
+        let relative_source =
+            pathdiff::diff_paths(source, link_dir).unwrap_or_else(|| source.to_path_buf());
         args.push(relative_source.to_string_lossy().to_string());
     } else {
         args.push(source.to_string_lossy().to_string());
     }
     args.push(dest.to_string_lossy().to_string());
-    
-    debug_log(debug, &format!("[DEBUG] Executing {} for llvmir: {} {}", 
-              cmd_name, cmd_path.display(), args.join(" ")));
-    
+
+    debug_log(
+        debug,
+        &format!(
+            "[DEBUG] Executing {} for llvmir: {} {}",
+            cmd_name,
+            cmd_path.display(),
+            args.join(" ")
+        ),
+    );
+
     match Command::new(cmd_path).args(&args).status() {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
@@ -491,14 +550,36 @@ pub fn sync_llvmir_with_aux_files(
     debug: bool,
 ) {
     // Execute main file operation
-    execute_file_cmd_for_llvmir(cmd_path, cmd_name, llvmir_source, llvmir_dest, other_args, skip_args, debug);
-    
+    execute_file_cmd_for_llvmir(
+        cmd_path,
+        cmd_name,
+        llvmir_source,
+        llvmir_dest,
+        other_args,
+        skip_args,
+        debug,
+    );
+
     // Sync auxiliary files
     for (suffix, aux_source) in find_all_aux_files(llvmir_source) {
         let aux_dest = PathBuf::from(format!("{}{}", llvmir_dest.display(), suffix.as_str()));
-        debug_log(debug, &format!("[DEBUG] Syncing aux file: {} -> {}", 
-                  aux_source.display(), aux_dest.display()));
-        execute_file_cmd_for_llvmir(cmd_path, cmd_name, &aux_source, &aux_dest, other_args, skip_args, debug);
+        debug_log(
+            debug,
+            &format!(
+                "[DEBUG] Syncing aux file: {} -> {}",
+                aux_source.display(),
+                aux_dest.display()
+            ),
+        );
+        execute_file_cmd_for_llvmir(
+            cmd_path,
+            cmd_name,
+            &aux_source,
+            &aux_dest,
+            other_args,
+            skip_args,
+            debug,
+        );
     }
 }
 
@@ -531,12 +612,28 @@ pub fn append_tmp_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// Escape shell argument
 pub fn shell_escape(s: &str) -> String {
     // If string contains special characters, wrap with single quotes
-    if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains('\\') 
-       || s.contains('$') || s.contains('`') || s.contains('!') || s.contains('*')
-       || s.contains('?') || s.contains('[') || s.contains(']') || s.contains('(')
-       || s.contains(')') || s.contains('{') || s.contains('}') || s.contains('|')
-       || s.contains('&') || s.contains(';') || s.contains('<') || s.contains('>')
-       || s.contains('~') {
+    if s.contains(' ')
+        || s.contains('"')
+        || s.contains('\'')
+        || s.contains('\\')
+        || s.contains('$')
+        || s.contains('`')
+        || s.contains('!')
+        || s.contains('*')
+        || s.contains('?')
+        || s.contains('[')
+        || s.contains(']')
+        || s.contains('(')
+        || s.contains(')')
+        || s.contains('{')
+        || s.contains('}')
+        || s.contains('|')
+        || s.contains('&')
+        || s.contains(';')
+        || s.contains('<')
+        || s.contains('>')
+        || s.contains('~')
+    {
         // Inside single quotes everything is literal except single quote itself
         // Single quote needs to be represented with '\''
         format!("'{}'", s.replace("'", "'\\''"))
@@ -549,44 +646,62 @@ pub fn shell_escape(s: &str) -> String {
 // @file argument expansion
 // ============================================================================
 
-use std::io::{BufRead, BufReader};
+fn split_response_args(content: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = content.chars().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                } else {
+                    current.push(ch);
+                }
+            }
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+            }
+            ch if ch.is_whitespace() && !in_single_quote && !in_double_quote => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    args
+}
 
 /// Expand @file arguments
 /// @file syntax reads arguments from file, one per line
 pub fn expand_at_file_args(args: &[String], debug_mode: bool) -> Vec<String> {
     let mut expanded_args: Vec<String> = Vec::new();
-    
+
     for arg in args {
-        if arg.starts_with('@') {
+        if let Some(file_path) = arg.strip_prefix('@') {
             // Get file path (remove @ prefix)
-            let file_path = &arg[1..];
-            
-            // Try to open and read the file
-            match File::open(file_path) {
-                Ok(file) => {
-                    let reader = BufReader::new(file);
-                    let mut lines_read = 0;
-                    
-                    for line in reader.lines() {
-                        match line {
-                            Ok(l) => {
-                                // Trim leading and trailing whitespace
-                                let trimmed = l.trim();
-                                if !trimmed.is_empty() {
-                                    // Split by whitespace, supporting multiple arguments per line
-                                    for part in trimmed.split_whitespace() {
-                                        expanded_args.push(part.to_string());
-                                        lines_read += 1;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: Failed to read line from {}: {}", file_path, e);
-                            }
-                        }
-                    }
-                    
-                    debug_log(debug_mode, &format!("[DEBUG] Expanded @{}: {} arguments", file_path, lines_read));
+            match fs::read_to_string(file_path) {
+                Ok(content) => {
+                    let parsed_args = split_response_args(&content);
+                    let args_read = parsed_args.len();
+                    expanded_args.extend(parsed_args);
+
+                    debug_log(
+                        debug_mode,
+                        &format!("[DEBUG] Expanded @{}: {} arguments", file_path, args_read),
+                    );
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to open @file '{}': {}", file_path, e);
@@ -598,6 +713,6 @@ pub fn expand_at_file_args(args: &[String], debug_mode: bool) -> Vec<String> {
             expanded_args.push(arg.clone());
         }
     }
-    
+
     expanded_args
 }

@@ -75,12 +75,21 @@ For each compiled/linked artifact, clang-wrap generates:
 ## Building
 
 ```bash
-cargo build --release
+make build
 ```
 
 ## Installation
 
 The compiled binaries should be placed in PATH before the actual tools they wrap, so they intercept calls to clang, ar, cp, etc.
+
+To build and install locally into `clang-wrap-install/bin`:
+
+```bash
+make install
+export PATH="$PWD/clang-wrap-install/bin:$PATH"
+```
+
+`make install` also detects locally available `clang`, `clang++`, `clang-NN`, and `clang++-NN` commands and creates matching symlinks to the `clang` wrapper. It also detects `llvm-ar` and target-prefixed GNU `ar` commands such as `x86_64-linux-gnu-ar`, creating matching symlinks to the `ar` wrapper.
 
 ## Usage
 

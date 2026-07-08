@@ -11,27 +11,27 @@ use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit, Stdio};
+use std::process::{exit, Command, Stdio};
 
-use clang_wrap::{debug_log, get_exe_path, get_llvm_ir_dir, is_debug_mode,
-    get_emit_llvmir_opt, find_llvm_tool, get_program_name,
-    get_absolute_path, ensure_dir_exists, generate_tmp_suffix, append_tmp_suffix,
-    shell_escape, expand_at_file_args, init_debug_log};
+use clang_wrap::{
+    append_tmp_suffix, debug_log, ensure_dir_exists, expand_at_file_args, find_llvm_tool,
+    find_llvmir_file, generate_tmp_suffix, get_absolute_path, get_emit_llvmir_opt, get_exe_path,
+    get_llvm_ir_dir, get_program_name, init_debug_log, is_debug_mode, shell_escape,
+};
 
 // ============================================================================
 // Constant definitions
 // ============================================================================
 
 /// Source file extensions
-const SOURCE_EXTENSIONS: &[&str] = &[".c", ".cpp", ".cc", ".cxx", ".c++", ".m", ".mm", ".S", ".s", ".asm"];
+const SOURCE_EXTENSIONS: &[&str] = &[
+    ".c", ".cpp", ".cc", ".cxx", ".c++", ".m", ".mm", ".S", ".s", ".asm",
+];
 
 /// Get clang version information
 fn get_clang_version(clang_path: &Path) -> Option<String> {
-    let output = Command::new(clang_path)
-        .arg("--version")
-        .output()
-        .ok()?;
-    
+    let output = Command::new(clang_path).arg("--version").output().ok()?;
+
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Some(first_line) = stdout.lines().next() {
@@ -39,6 +39,337 @@ fn get_clang_version(clang_path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+fn clang_major_version(version: &str) -> Option<&str> {
+    let version_pos = version.find("version")?;
+    let after_version = &version[version_pos + "version".len()..];
+    let start = after_version.find(|ch: char| ch.is_ascii_digit())?;
+    let major = after_version[start..]
+        .split(|ch: char| !ch.is_ascii_digit())
+        .next()?;
+
+    if major.is_empty() {
+        None
+    } else {
+        Some(major)
+    }
+}
+
+fn precise_usr_bin_clang_path(clang_path: &Path, clang_version: &str) -> PathBuf {
+    let Some(major) = clang_major_version(clang_version) else {
+        return clang_path.to_path_buf();
+    };
+
+    if clang_path == Path::new("/usr/bin/clang") {
+        PathBuf::from(format!("clang-{}", major))
+    } else if clang_path == Path::new("/usr/bin/clang++") {
+        PathBuf::from(format!("clang++-{}", major))
+    } else {
+        clang_path.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clang_major_version_parses_common_version_lines() {
+        assert_eq!(
+            clang_major_version("Ubuntu clang version 21.1.8 (6ubuntu1)"),
+            Some("21")
+        );
+        assert_eq!(
+            clang_major_version("Debian clang version 19.1.7 (++20250114073446+cd708029e0b2-1)"),
+            Some("19")
+        );
+        assert_eq!(clang_major_version("not a clang banner"), None);
+    }
+
+    #[test]
+    fn precise_usr_bin_clang_path_uses_versioned_command_name() {
+        assert_eq!(
+            precise_usr_bin_clang_path(
+                Path::new("/usr/bin/clang"),
+                "Ubuntu clang version 21.1.8 (6ubuntu1)",
+            ),
+            PathBuf::from("clang-21")
+        );
+        assert_eq!(
+            precise_usr_bin_clang_path(
+                Path::new("/usr/bin/clang++"),
+                "Ubuntu clang version 21.1.8 (6ubuntu1)",
+            ),
+            PathBuf::from("clang++-21")
+        );
+        assert_eq!(
+            precise_usr_bin_clang_path(
+                Path::new("/opt/llvm/bin/clang"),
+                "Ubuntu clang version 21.1.8 (6ubuntu1)",
+            ),
+            PathBuf::from("/opt/llvm/bin/clang")
+        );
+    }
+}
+
+fn canonical_or_absolute_path(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| get_absolute_path(path))
+}
+
+fn resolve_library_in_dir(dir: &Path, lib: &str) -> Option<PathBuf> {
+    if let Some(exact_name) = lib.strip_prefix(':') {
+        let candidate = dir.join(exact_name);
+        if candidate.exists() {
+            return Some(canonical_or_absolute_path(&candidate));
+        }
+        return None;
+    }
+
+    for filename in [format!("lib{}.so", lib), format!("lib{}.a", lib)] {
+        let candidate = dir.join(filename);
+        if candidate.exists() {
+            return Some(canonical_or_absolute_path(&candidate));
+        }
+    }
+
+    None
+}
+
+fn configured_library_dirs(library_dirs: &[String]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    for dir in library_dirs {
+        dirs.push(get_absolute_path(Path::new(dir)));
+    }
+
+    if let Ok(library_path) = env::var("LIBRARY_PATH") {
+        for dir in library_path.split(':').filter(|dir| !dir.is_empty()) {
+            dirs.push(get_absolute_path(Path::new(dir)));
+        }
+    }
+
+    dirs
+}
+
+fn ldconfig_library_paths(lib: &str) -> Vec<PathBuf> {
+    let output = match Command::new("ldconfig").arg("-p").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let exact_name = lib.strip_prefix(':').unwrap_or(lib);
+    let shared_prefix = format!("lib{}.so.", lib);
+    let shared_name = format!("lib{}.so", lib);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut paths = Vec::new();
+
+    for line in stdout.lines() {
+        let Some((name_part, path_part)) = line.split_once("=>") else {
+            continue;
+        };
+        let Some(name) = name_part.split_whitespace().next() else {
+            continue;
+        };
+
+        let matches = if lib.starts_with(':') {
+            name == exact_name
+        } else {
+            name == shared_name || name.starts_with(&shared_prefix)
+        };
+
+        if matches {
+            paths.push(canonical_or_absolute_path(Path::new(path_part.trim())));
+        }
+    }
+
+    paths
+}
+
+fn default_library_dirs(clang_path: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(output) = Command::new(clang_path).arg("-print-search-dirs").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(paths) = line.strip_prefix("libraries: =") {
+                    for dir in paths.split(':').filter(|dir| !dir.is_empty()) {
+                        dirs.push(get_absolute_path(Path::new(dir)));
+                    }
+                }
+            }
+        }
+    }
+
+    for dir in [
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/local/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib/riscv64-linux-gnu",
+        "/lib/riscv64-linux-gnu",
+    ] {
+        dirs.push(PathBuf::from(dir));
+    }
+
+    dirs
+}
+
+fn resolve_link_library(lib: &str, library_dirs: &[String], clang_path: &Path) -> Option<PathBuf> {
+    for dir in configured_library_dirs(library_dirs) {
+        if let Some(path) = resolve_library_in_dir(&dir, lib) {
+            return Some(path);
+        }
+    }
+
+    for dir in default_library_dirs(clang_path) {
+        if let Some(path) = resolve_library_in_dir(&dir, lib) {
+            return Some(path);
+        }
+    }
+
+    if let Some(path) = ldconfig_library_paths(lib).into_iter().next() {
+        return Some(path);
+    }
+
+    None
+}
+
+fn exact_link_arg_for_library_path(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("-l:{}", name))
+}
+
+fn push_array_arg(script: &mut String, arg: &str) {
+    script.push_str("  ");
+    script.push_str(&shell_escape(arg));
+    script.push('\n');
+}
+
+fn linker_script_members(path: &Path) -> Option<Vec<String>> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut members = Vec::new();
+    let mut rest = content.as_str();
+
+    while let Some(start) = rest.find("INPUT(").or_else(|| rest.find("GROUP(")) {
+        let after_keyword = &rest[start..];
+        let open = after_keyword.find('(')?;
+        let after_open = &after_keyword[open + 1..];
+        let Some(close) = after_open.find(')') else {
+            break;
+        };
+
+        for token in after_open[..close].split_whitespace() {
+            let member = token.trim_matches(|c| c == ',' || c == '"' || c == '\'');
+            if !member.is_empty() {
+                members.push(member.to_string());
+            }
+        }
+
+        rest = &after_open[close + 1..];
+    }
+
+    if members.is_empty() {
+        None
+    } else {
+        Some(members)
+    }
+}
+
+fn push_library_path_link_args(
+    script: &mut String,
+    lib_file: &Path,
+    library_dirs: &[String],
+    clang_path: &Path,
+    visited: &mut Vec<PathBuf>,
+) -> bool {
+    let canonical_path = canonical_or_absolute_path(lib_file);
+
+    if visited.contains(&canonical_path) {
+        return true;
+    }
+
+    if let Some(members) = linker_script_members(&canonical_path) {
+        visited.push(canonical_path.clone());
+        let script_dir = canonical_path.parent().unwrap_or(Path::new("."));
+        let mut expanded_any = false;
+
+        for member in members {
+            if let Some(lib) = member.strip_prefix("-l") {
+                if push_resolved_library_link_args(script, lib, library_dirs, clang_path, visited) {
+                    expanded_any = true;
+                } else {
+                    push_array_arg(script, &member);
+                    expanded_any = true;
+                }
+                continue;
+            }
+
+            let member_path = Path::new(&member);
+            let candidate = if member_path.is_absolute() {
+                member_path.to_path_buf()
+            } else {
+                script_dir.join(member_path)
+            };
+
+            if candidate.exists() {
+                expanded_any |= push_library_path_link_args(
+                    script,
+                    &candidate,
+                    library_dirs,
+                    clang_path,
+                    visited,
+                );
+            } else {
+                push_array_arg(script, &member);
+                expanded_any = true;
+            }
+        }
+
+        return expanded_any;
+    }
+
+    let Some(exact_arg) = exact_link_arg_for_library_path(&canonical_path) else {
+        return false;
+    };
+
+    push_array_arg(script, &exact_arg);
+    true
+}
+
+fn push_resolved_library_link_args(
+    script: &mut String,
+    lib: &str,
+    library_dirs: &[String],
+    clang_path: &Path,
+    visited: &mut Vec<PathBuf>,
+) -> bool {
+    let Some(path) = resolve_link_library(lib, library_dirs, clang_path) else {
+        return false;
+    };
+
+    push_library_path_link_args(script, &path, library_dirs, clang_path, visited)
+}
+
+fn is_rpath_arg(arg: &str) -> bool {
+    matches!(arg, "-rpath" | "--rpath" | "-Wl,-rpath" | "-Wl,--rpath")
+        || arg.starts_with("-rpath=")
+        || arg.starts_with("--rpath=")
+        || arg.starts_with("-Wl,-rpath,")
+        || arg.starts_with("-Wl,--rpath,")
+        || arg.starts_with("-Wl,-rpath=")
+        || arg.starts_with("-Wl,--rpath=")
+}
+
+fn rpath_arg_consumes_next(arg: &str) -> bool {
+    matches!(arg, "-rpath" | "--rpath" | "-Wl,-rpath" | "-Wl,--rpath")
 }
 
 /// Handle link command (generate executable or shared library)
@@ -65,7 +396,7 @@ fn handle_link_command(
 
     while i < args.len() {
         let arg = &args[i];
-        
+
         if arg == "-o" {
             if i + 1 < args.len() {
                 output_file = Some(PathBuf::from(&args[i + 1]));
@@ -105,19 +436,19 @@ fn handle_link_command(
             object_files.push(PathBuf::from(arg));
         } else if !arg.starts_with('-') && SOURCE_EXTENSIONS.iter().any(|ext| arg.ends_with(ext)) {
             source_files.push(PathBuf::from(arg));
-        } else if !arg.starts_with('-') && (arg.ends_with(".so") || arg.contains(".so.") || arg.ends_with(".a")) {
+        } else if !arg.starts_with('-')
+            && (arg.ends_with(".so") || arg.contains(".so.") || arg.ends_with(".a"))
+        {
             library_files.push(PathBuf::from(arg));
         } else if arg.starts_with("-Wl,") || arg.starts_with("-framework") {
-            let normalized_arg = if arg.starts_with("-Wl,-version-script,") {
-                let path = &arg[20..];
+            let normalized_arg = if let Some(path) = arg.strip_prefix("-Wl,-version-script,") {
                 format!("-Wl,--version-script={}", path)
-            } else if arg.starts_with("-Wl,--version-script,") {
-                let path = &arg[21..];
+            } else if let Some(path) = arg.strip_prefix("-Wl,--version-script,") {
                 format!("-Wl,--version-script={}", path)
             } else if arg == "-Wl,-version-script" {
                 if i + 1 < args.len() && args[i + 1].starts_with("-Wl,") {
                     let next_arg = &args[i + 1];
-                    let path = &next_arg[4..];
+                    let path = next_arg.strip_prefix("-Wl,").unwrap_or(next_arg);
                     i += 1;
                     format!("-Wl,--version-script={}", path)
                 } else {
@@ -126,7 +457,7 @@ fn handle_link_command(
             } else if arg == "-Wl,-soname" {
                 if i + 1 < args.len() && args[i + 1].starts_with("-Wl,") {
                     let next_arg = &args[i + 1];
-                    let soname = &next_arg[4..];
+                    let soname = next_arg.strip_prefix("-Wl,").unwrap_or(next_arg);
                     i += 1;
                     format!("-Wl,-soname,{}", soname)
                 } else {
@@ -135,17 +466,15 @@ fn handle_link_command(
             } else {
                 arg.clone()
             };
-            
+
             link_flags.push(normalized_arg.clone());
             other_args.push(normalized_arg.clone());
-            
-            if normalized_arg.starts_with("-Wl,--version-script=") {
-                let path = &normalized_arg[21..];
+
+            if let Some(path) = normalized_arg.strip_prefix("-Wl,--version-script=") {
                 version_script = Some(PathBuf::from(path));
             }
-            
-            if normalized_arg.starts_with("-Wl,-soname,") {
-                let soname = &normalized_arg[13..];
+
+            if let Some(soname) = normalized_arg.strip_prefix("-Wl,-soname,") {
                 if let Some(idx) = soname.rfind(".so.") {
                     let sover = &soname[idx + 4..];
                     soversion = Some(sover.to_string());
@@ -154,7 +483,7 @@ fn handle_link_command(
         } else {
             other_args.push(arg.clone());
         }
-        
+
         i += 1;
     }
 
@@ -164,13 +493,20 @@ fn handle_link_command(
     };
 
     // First pass: normal linking
-    debug_log(debug_mode, &format!("[DEBUG] Normal linking: {} {}", clang_path.display(), args[1..].join(" ")));
-    
+    debug_log(
+        debug_mode,
+        &format!(
+            "[DEBUG] Normal linking: {} {}",
+            clang_path.display(),
+            args[1..].join(" ")
+        ),
+    );
+
     let status = Command::new(clang_path)
         .args(&args[1..])
         .status()
-        .expect(&format!("Failed to execute {}", clang_path.display()));
-    
+        .unwrap_or_else(|_| panic!("Failed to execute {}", clang_path.display()));
+
     if !status.success() {
         exit(status.code().unwrap_or(1));
     }
@@ -179,70 +515,80 @@ fn handle_link_command(
     let mut llvm_ir_files: Vec<PathBuf> = Vec::new();
     let mut temp_llvm_ir_files: Vec<PathBuf> = Vec::new();
     let mut merged_static_lib_paths: Vec<PathBuf> = Vec::new();
-    
+
     // 1. Find LLVM IR files corresponding to .o files
     for obj_file in &object_files {
         let abs_obj = get_absolute_path(obj_file);
-        
+
         let mut ir_path = PathBuf::from(llvm_ir_dir);
-        let rel_path = abs_obj.strip_prefix("/")
-            .unwrap_or(&abs_obj);
+        let rel_path = abs_obj.strip_prefix("/").unwrap_or(&abs_obj);
         ir_path.push(rel_path);
-        
+
         if ir_path.exists() {
             llvm_ir_files.push(ir_path);
         } else {
-            debug_log(debug_mode, &format!("[DEBUG] Warning: LLVM IR file not found: {}", ir_path.display()));
+            debug_log(
+                debug_mode,
+                &format!(
+                    "[DEBUG] Warning: LLVM IR file not found: {}",
+                    ir_path.display()
+                ),
+            );
         }
     }
-    
+
     // 1.5 Find LLVM IR files corresponding to static libraries
     for lib_file in &library_files {
         if !lib_file.extension().map(|e| e == "a").unwrap_or(false) {
             continue;
         }
-        
-        let abs_lib = get_absolute_path(lib_file);
-        
-        let mut ir_path = PathBuf::from(llvm_ir_dir);
-        let rel_path = abs_lib.strip_prefix("/")
-            .unwrap_or(&abs_lib);
-        ir_path.push(rel_path);
-        
-        if ir_path.exists() {
-            debug_log(debug_mode, &format!("[DEBUG] Found LLVM IR for static library: {} -> {}", lib_file.display(), ir_path.display()));
+
+        if let Some(ir_path) = find_llvmir_file(lib_file, llvm_ir_dir) {
+            debug_log(
+                debug_mode,
+                &format!(
+                    "[DEBUG] Found LLVM IR for static library: {} -> {}",
+                    lib_file.display(),
+                    ir_path.display()
+                ),
+            );
             llvm_ir_files.push(ir_path);
             merged_static_lib_paths.push(lib_file.clone());
         } else {
-            debug_log(debug_mode, &format!("[DEBUG] Warning: LLVM IR file not found for static library: {}", ir_path.display()));
+            debug_log(
+                debug_mode,
+                &format!(
+                    "[DEBUG] Warning: LLVM IR file not found for static library: {}",
+                    lib_file.display()
+                ),
+            );
         }
     }
-    
+
     // 2. Generate LLVM IR for source files
     for source_file in &source_files {
         let abs_source = get_absolute_path(source_file);
-        
+
         let mut ir_path = PathBuf::from(llvm_ir_dir);
-        let rel_source = abs_source.strip_prefix("/")
-            .unwrap_or(&abs_source);
+        let rel_source = abs_source.strip_prefix("/").unwrap_or(&abs_source);
         ir_path.push(rel_source);
         ir_path.set_extension("bc");
-        
+
         if let Err(e) = ensure_dir_exists(&ir_path) {
             eprintln!("Failed to create LLVM IR output directory: {}", e);
             exit(1);
         }
-        
+
         let tmp_suffix = generate_tmp_suffix();
         let tmp_ir_path = append_tmp_suffix(&ir_path, &tmp_suffix);
-        
+
         let mut llvm_gen_cmd = Command::new(clang_path);
         llvm_gen_cmd.args(&other_args);
         llvm_gen_cmd.arg("-emit-llvm");
         llvm_gen_cmd.arg("-c");
         llvm_gen_cmd.arg(source_file);
         llvm_gen_cmd.arg("-o").arg(&tmp_ir_path);
-        
+
         {
             let mut cmd_parts = vec![clang_path.display().to_string()];
             cmd_parts.extend(other_args.clone());
@@ -251,11 +597,17 @@ fn handle_link_command(
             cmd_parts.push(source_file.display().to_string());
             cmd_parts.push("-o".to_string());
             cmd_parts.push(tmp_ir_path.display().to_string());
-            debug_log(debug_mode, &format!("[DEBUG] Generating LLVM IR for source: {}", cmd_parts.join(" ")));
+            debug_log(
+                debug_mode,
+                &format!(
+                    "[DEBUG] Generating LLVM IR for source: {}",
+                    cmd_parts.join(" ")
+                ),
+            );
         }
-        
+
         let llvm_gen_result = llvm_gen_cmd.status();
-        
+
         match llvm_gen_result {
             Ok(status) if status.success() => {
                 llvm_ir_files.push(tmp_ir_path.clone());
@@ -281,15 +633,17 @@ fn handle_link_command(
     }
 
     if llvm_ir_files.is_empty() {
-        debug_log(debug_mode, "[DEBUG] No LLVM IR files found, skipping llvm-link");
+        debug_log(
+            debug_mode,
+            "[DEBUG] No LLVM IR files found, skipping llvm-link",
+        );
         exit(0);
     }
 
     let abs_output = get_absolute_path(&output_path);
 
     let mut llvm_link_output = PathBuf::from(llvm_ir_dir);
-    let rel_output = abs_output.strip_prefix("/")
-        .unwrap_or(&abs_output);
+    let rel_output = abs_output.strip_prefix("/").unwrap_or(&abs_output);
     llvm_link_output.push(rel_output);
 
     if let Err(e) = ensure_dir_exists(&llvm_link_output) {
@@ -297,14 +651,15 @@ fn handle_link_command(
         exit(1);
     }
 
-    let clang_cmd_name = clang_path.file_name()
+    let clang_cmd_name = clang_path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("clang");
     let llvm_link_path = find_llvm_tool("llvm-link", clang_cmd_name);
-    
+
     let mut llvm_link_cmd = Command::new(&llvm_link_path);
     llvm_link_cmd.arg("-o").arg(&llvm_link_output);
-    
+
     for ir_file in &llvm_ir_files {
         llvm_link_cmd.arg(ir_file);
     }
@@ -316,7 +671,10 @@ fn handle_link_command(
         for ir_file in &llvm_ir_files {
             cmd_parts.push(ir_file.display().to_string());
         }
-        debug_log(debug_mode, &format!("[DEBUG] llvm-link: {}", cmd_parts.join(" ")));
+        debug_log(
+            debug_mode,
+            &format!("[DEBUG] llvm-link: {}", cmd_parts.join(" ")),
+        );
     }
 
     let log_path = format!("{}_log", llvm_link_output.display());
@@ -339,7 +697,7 @@ fn handle_link_command(
     for ir_file in &llvm_ir_files {
         cmd_parts.push(ir_file.display().to_string());
     }
-    
+
     let cmd_str = cmd_parts.join(" ");
     let _ = writeln!(log_file, "Command: {}", cmd_str);
 
@@ -352,27 +710,40 @@ fn handle_link_command(
         Ok(status) if status.success() => {
             for ir_file in &temp_llvm_ir_files {
                 if let Err(e) = fs::remove_file(ir_file) {
-                    eprintln!("Warning: Failed to remove intermediate file {}: {}", ir_file.display(), e);
+                    eprintln!(
+                        "Warning: Failed to remove intermediate file {}: {}",
+                        ir_file.display(),
+                        e
+                    );
                 }
             }
-            
+
             let version_script_dest = if let Some(ref vs_path) = version_script {
-                let output_name = output_path.file_name()
+                let output_name = output_path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("output");
-                
+
                 let vs_filename = format!("{}_verscript", output_name);
-                
-                let vs_dest = llvm_link_output.parent()
+
+                let vs_dest = llvm_link_output
+                    .parent()
                     .map(|p| p.join(&vs_filename))
                     .unwrap_or_else(|| PathBuf::from(&vs_filename));
-                
+
                 if vs_path.exists() {
                     if let Err(e) = fs::copy(vs_path, &vs_dest) {
                         eprintln!("Warning: Failed to copy version script: {}", e);
                         None
                     } else {
-                        debug_log(debug_mode, &format!("[DEBUG] Copied version script: {} -> {}", vs_path.display(), vs_dest.display()));
+                        debug_log(
+                            debug_mode,
+                            &format!(
+                                "[DEBUG] Copied version script: {} -> {}",
+                                vs_path.display(),
+                                vs_dest.display()
+                            ),
+                        );
                         Some(vs_dest)
                     }
                 } else {
@@ -382,7 +753,7 @@ fn handle_link_command(
             } else {
                 None
             };
-            
+
             if let Err(e) = generate_link_cmd_file(
                 clang_path,
                 &llvm_link_output,
@@ -400,7 +771,7 @@ fn handle_link_command(
             ) {
                 eprintln!("Warning: Failed to generate _cmd file: {}", e);
             }
-            
+
             exit(0);
         }
         Ok(status) => {
@@ -421,6 +792,7 @@ fn handle_link_command(
 }
 
 /// Generate link command script (_cmd file)
+#[allow(clippy::too_many_arguments)]
 fn generate_link_cmd_file(
     clang_path: &Path,
     llvm_link_output: &Path,
@@ -437,15 +809,17 @@ fn generate_link_cmd_file(
     soversion: Option<&str>,
 ) -> Result<(), std::io::Error> {
     let cmd_path = format!("{}_cmd", llvm_link_output.display());
-    
-    let bc_filename = llvm_link_output.file_name()
+
+    let bc_filename = llvm_link_output
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("output.bc");
-    
-    let original_output_filename = original_output.file_name()
+
+    let original_output_filename = original_output
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("a.out");
-    
+
     let output_filename = if is_shared {
         if let Some(sov) = soversion {
             if let Some(idx) = original_output_filename.find(".so") {
@@ -461,9 +835,10 @@ fn generate_link_cmd_file(
     } else {
         original_output_filename.to_string()
     };
-    
+
     let clang_version = get_clang_version(clang_path).unwrap_or_else(|| "unknown".to_string());
-    
+    let cmd_clang_path = precise_usr_bin_clang_path(clang_path, &clang_version);
+
     let mut script = String::new();
     script.push_str("#!/bin/bash\n");
     script.push_str("#\n");
@@ -476,36 +851,42 @@ fn generate_link_cmd_file(
     script.push_str("# Generated by clang-wrap\n");
     script.push_str("# Clang version: ");
     script.push_str(&clang_version);
-    script.push_str("\n");
+    script.push('\n');
     script.push_str("# Original output: ");
     script.push_str(&output_filename);
-    script.push_str("\n");
+    script.push('\n');
     script.push_str("#\n");
-    script.push_str("\n");
+    script.push('\n');
     script.push_str("set -e\n\n");
-    
+
     script.push_str("# Create output directory\n");
     script.push_str("mkdir -p output\n\n");
-    
+
     script.push_str("# Link bitcode with original options\n");
-    script.push_str("cmd=\"");
-    script.push_str(&clang_path.display().to_string());
-    
+    script.push_str("cmd=(\n");
+    push_array_arg(&mut script, &cmd_clang_path.display().to_string());
+
     if is_shared {
-        script.push_str(" -shared -fPIC");
+        push_array_arg(&mut script, "-shared");
+        push_array_arg(&mut script, "-fPIC");
     }
-    
-    script.push_str(" -x ir");
-    script.push_str(" -fuse-ld=lld");
-    
+
+    push_array_arg(&mut script, "-x");
+    push_array_arg(&mut script, "ir");
+    push_array_arg(&mut script, "-fuse-ld=lld");
+
     let mut skip_next = false;
     for arg in other_args {
         if skip_next {
             skip_next = false;
             continue;
         }
-        
+
         if arg == "-c" || arg == "-emit-llvm" || arg == "-shared" {
+            continue;
+        }
+        if is_rpath_arg(arg) {
+            skip_next = rpath_arg_consumes_next(arg);
             continue;
         }
         if arg.starts_with("-Wl,--version-script=") {
@@ -593,121 +974,94 @@ fn generate_link_cmd_file(
         if arg.starts_with("-std=") {
             continue;
         }
-        
-        script.push_str(" ");
-        script.push_str(&shell_escape(arg));
+
+        push_array_arg(&mut script, arg);
     }
-    
+
+    let mut skip_next_link_flag = false;
     for flag in link_flags {
+        if skip_next_link_flag {
+            skip_next_link_flag = false;
+            continue;
+        }
         if flag == "-shared" && is_shared {
             continue;
         }
         if flag.starts_with("-L") || flag.starts_with("-l") {
             continue;
         }
+        if is_rpath_arg(flag) {
+            skip_next_link_flag = rpath_arg_consumes_next(flag);
+            continue;
+        }
         if flag.starts_with("-Wl,--version-script=") {
             continue;
         }
-        script.push_str(" ");
-        script.push_str(&shell_escape(flag));
+        push_array_arg(&mut script, flag);
     }
-    
+
     for dir in library_dirs {
-        script.push_str(" -L");
-        script.push_str(&shell_escape(dir));
+        push_array_arg(&mut script, &format!("-L{}", dir));
     }
-    
-    script.push_str(" -L ..");
-    
-    script.push_str(" ./");
-    script.push_str(bc_filename);
-    
+
+    push_array_arg(&mut script, "-L");
+    push_array_arg(&mut script, "..");
+
+    push_array_arg(&mut script, &format!("./{}", bc_filename));
+
+    let mut visited_linker_scripts = Vec::new();
+
     for lib_file in library_files {
         if merged_static_libs.contains(lib_file) {
             continue;
         }
-        
-        if let Some(lib_basename) = lib_file.file_name().and_then(|n| n.to_str()) {
-            if lib_basename.starts_with("lib") {
-                let lib_name = if let Some(idx) = lib_basename.find(".so") {
-                    &lib_basename[3..idx]
-                } else if let Some(idx) = lib_basename.find(".a") {
-                    &lib_basename[3..idx]
-                } else {
-                    lib_basename
-                };
-                script.push_str(" -l");
-                script.push_str(lib_name);
-            } else {
-                script.push_str(" ./");
-                script.push_str(lib_basename);
-            }
+
+        if push_library_path_link_args(
+            &mut script,
+            lib_file,
+            library_dirs,
+            clang_path,
+            &mut visited_linker_scripts,
+        ) {
+            continue;
+        }
+
+        push_array_arg(
+            &mut script,
+            &canonical_or_absolute_path(lib_file).display().to_string(),
+        );
+    }
+
+    for lib in libraries {
+        if !push_resolved_library_link_args(
+            &mut script,
+            lib,
+            library_dirs,
+            clang_path,
+            &mut visited_linker_scripts,
+        ) {
+            push_array_arg(&mut script, &format!("-l{}", lib));
         }
     }
-    
-    for lib in libraries {
-        script.push_str(" -l");
-        script.push_str(&shell_escape(lib));
-    }
-    
+
     if let Some(vs_path) = version_script_dest {
         if let Some(vs_filename) = vs_path.file_name().and_then(|n| n.to_str()) {
-            script.push_str(" -Wl,--version-script=./");
-            script.push_str(vs_filename);
+            push_array_arg(
+                &mut script,
+                &format!("-Wl,--version-script=./{}", vs_filename),
+            );
         }
     }
-    
-    script.push_str(" -o output/");
-    script.push_str(&output_filename);
-    script.push_str("\"\n\n");
-    
-    script.push_str("# Function to replace library paths with .bc files\n");
-    script.push_str("_try_bc() {\n");
-    script.push_str("  local cmd_dir=\"$(dirname \"$0\")\"\n");
-    script.push_str("  local llvmir_dir=\"$cmd_dir\"\n");
-    script.push_str("  local result=\"\"\n");
-    script.push_str("  local seen_libs=\"\"\n");
-    script.push_str("  for arg in $@; do\n");
-    script.push_str("    case \"$arg\" in\n");
-    script.push_str("      -*)\n");
-    script.push_str("        result=\"$result $arg\"\n");
-    script.push_str("        ;;\n");
-    script.push_str("      output/*)\n");
-    script.push_str("        result=\"$result $arg\"\n");
-    script.push_str("        ;;\n");
-    script.push_str("      *.a|*.so|*.so.*)\n");
-    script.push_str("        local lib_basename=$(basename \"$arg\")\n");
-    script.push_str("        if echo \"$seen_libs\" | grep -q \" $lib_basename \"; then\n");
-    script.push_str("          continue\n");
-    script.push_str("        fi\n");
-    script.push_str("        seen_libs=\"$seen_libs $lib_basename \"\n");
-    script.push_str("        if [ -f \"$arg\" ]; then\n");
-    script.push_str("          result=\"$result $arg\"\n");
-    script.push_str("        else\n");
-    script.push_str("          local bc_file=\"$llvmir_dir/$lib_basename.bc\"\n");
-    script.push_str("          if [ -f \"$bc_file\" ]; then\n");
-    script.push_str("            result=\"$result $bc_file\"\n");
-    script.push_str("          else\n");
-    script.push_str("            result=\"$result $arg\"\n");
-    script.push_str("          fi\n");
-    script.push_str("        fi\n");
-    script.push_str("        ;;\n");
-    script.push_str("      *)\n");
-    script.push_str("        result=\"$result $arg\"\n");
-    script.push_str("        ;;\n");
-    script.push_str("    esac\n");
-    script.push_str("  done\n");
-    script.push_str("  \n");
-    script.push_str("  echo \"$result\"\n");
-    script.push_str("}\n\n");
-    
-    script.push_str("# Execute link command with .bc file substitution\n");
-    script.push_str("newcmd=`_try_bc $cmd`\n");
-    script.push_str("eval $newcmd\n");
-    
+
+    push_array_arg(&mut script, &format!("--output=output/{}", output_filename));
+    script.push_str(")\n\n");
+
+    script.push_str("# Execute link command\n");
+    script.push_str("\"${cmd[@]}\"\n");
+
     let mut file = File::create(&cmd_path)?;
     file.write_all(script.as_bytes())?;
-    
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -715,16 +1069,16 @@ fn generate_link_cmd_file(
         perms.set_mode(0o755);
         fs::set_permissions(&cmd_path, perms)?;
     }
-    
+
     Ok(())
 }
 
 fn main() {
     let original_args: Vec<String> = env::args().collect();
-    
+
     // Get program name
     let program_name = get_program_name(&original_args);
-    
+
     // Determine the actual clang executable to invoke
     let clang_cmd = if program_name == "clang-wrap" {
         "clang"
@@ -733,25 +1087,25 @@ fn main() {
     } else {
         program_name
     };
-    
+
     // Get the real clang path (skip self)
     let clang_path = get_exe_path(clang_cmd);
-    
+
     if original_args.len() < 2 {
         let status = Command::new(&clang_path)
             .status()
-            .expect(&format!("Failed to execute {}", clang_path.display()));
+            .unwrap_or_else(|_| panic!("Failed to execute {}", clang_path.display()));
         exit(status.code().unwrap_or(1));
     }
 
     let debug_mode = is_debug_mode();
-    
+
     let args = expand_at_file_args(&original_args, debug_mode);
 
     let emit_llvmir_opt = get_emit_llvmir_opt();
-    
+
     let llvm_ir_dir = get_llvm_ir_dir();
-    
+
     // Initialize debug log
     if debug_mode {
         init_debug_log(&llvm_ir_dir);
@@ -760,7 +1114,7 @@ fn main() {
     // Check for -c and -E options
     let compile_flag_pos = args.iter().position(|arg| arg == "-c");
     let preprocess_flag_pos = args.iter().position(|arg| arg == "-E");
-    
+
     let (has_compile_flag, has_preprocess_flag) = match (compile_flag_pos, preprocess_flag_pos) {
         (Some(c_pos), Some(e_pos)) => {
             if c_pos > e_pos {
@@ -773,43 +1127,50 @@ fn main() {
         (None, Some(_)) => (false, true),
         (None, None) => (false, false),
     };
-    
+
     let has_shared_flag = args.iter().any(|arg| arg == "-shared");
-    let has_object_inputs = args[1..].iter().any(|arg| {
-        arg.ends_with(".o") && !arg.starts_with('-')
-    });
-    
-    let has_source_inputs = args[1..].iter().any(|arg| {
-        !arg.starts_with('-') && SOURCE_EXTENSIONS.iter().any(|ext| arg.ends_with(ext))
-    });
-    
-    let is_link_command = !has_compile_flag && (has_object_inputs || has_shared_flag || has_source_inputs);
-    
+    let has_object_inputs = args[1..]
+        .iter()
+        .any(|arg| arg.ends_with(".o") && !arg.starts_with('-'));
+
+    let has_source_inputs = args[1..]
+        .iter()
+        .any(|arg| !arg.starts_with('-') && SOURCE_EXTENSIONS.iter().any(|ext| arg.ends_with(ext)));
+
+    let is_link_command =
+        !has_compile_flag && (has_object_inputs || has_shared_flag || has_source_inputs);
+
     if has_preprocess_flag {
         let status = Command::new(&clang_path)
             .args(&args[1..])
             .status()
-            .expect(&format!("Failed to execute {}", clang_path.display()));
+            .unwrap_or_else(|_| panic!("Failed to execute {}", clang_path.display()));
         exit(status.code().unwrap_or(1));
     }
-    
+
     if !has_compile_flag && !is_link_command {
         let status = Command::new(&clang_path)
             .args(&args[1..])
             .status()
-            .expect(&format!("Failed to execute {}", clang_path.display()));
+            .unwrap_or_else(|_| panic!("Failed to execute {}", clang_path.display()));
         exit(status.code().unwrap_or(1));
     }
-    
+
     if is_link_command {
         if emit_llvmir_opt.is_none() {
             let status = Command::new(&clang_path)
                 .args(&args[1..])
                 .status()
-                .expect(&format!("Failed to execute {}", clang_path.display()));
+                .unwrap_or_else(|_| panic!("Failed to execute {}", clang_path.display()));
             exit(status.code().unwrap_or(1));
         }
-        handle_link_command(&clang_path, &args, &llvm_ir_dir, emit_llvmir_opt.as_deref(), debug_mode);
+        handle_link_command(
+            &clang_path,
+            &args,
+            &llvm_ir_dir,
+            emit_llvmir_opt.as_deref(),
+            debug_mode,
+        );
     }
 
     // Parse compilation arguments
@@ -819,19 +1180,39 @@ fn main() {
     let mut i = 1;
 
     let options_with_arg = [
-        "-MT", "-MF", "-MQ", "-MD", "-MMD",
-        "-I", "-L", "-l", "-D", "-U",
-        "-include", "-imacros", "-idirafter", "-iprefix", "-iwithprefix",
-        "-iwithprefixbefore", "-isystem", "-iquote", "-isysroot",
-        "-framework", "-F",
-        "-x", "-std", "-arch",
-        "-target", "-mllvm",
-        "--param", "-Xclang",
+        "-MT",
+        "-MF",
+        "-MQ",
+        "-MD",
+        "-MMD",
+        "-I",
+        "-L",
+        "-l",
+        "-D",
+        "-U",
+        "-include",
+        "-imacros",
+        "-idirafter",
+        "-iprefix",
+        "-iwithprefix",
+        "-iwithprefixbefore",
+        "-isystem",
+        "-iquote",
+        "-isysroot",
+        "-framework",
+        "-F",
+        "-x",
+        "-std",
+        "-arch",
+        "-target",
+        "-mllvm",
+        "--param",
+        "-Xclang",
     ];
 
     while i < args.len() {
         let arg = &args[i];
-        
+
         if arg == "-o" {
             if i + 1 < args.len() {
                 output_file = Some(PathBuf::from(&args[i + 1]));
@@ -856,7 +1237,7 @@ fn main() {
         } else {
             other_args.push(arg.clone());
         }
-        
+
         i += 1;
     }
 
@@ -864,7 +1245,8 @@ fn main() {
         Some(path) => path.clone(),
         None => {
             if let Some(ref input) = input_file {
-                let stem = input.file_stem()
+                let stem = input
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("output");
                 PathBuf::from(format!("{}.o", stem))
@@ -877,13 +1259,20 @@ fn main() {
     // First pass: normal compilation
     let mut normal_cmd = Command::new(&clang_path);
     normal_cmd.args(&args[1..]);
-    
-    debug_log(debug_mode, &format!("[DEBUG] Normal compilation: {} {}", clang_path.display(), args[1..].join(" ")));
-    
+
+    debug_log(
+        debug_mode,
+        &format!(
+            "[DEBUG] Normal compilation: {} {}",
+            clang_path.display(),
+            args[1..].join(" ")
+        ),
+    );
+
     let normal_result = normal_cmd.status();
-    
+
     match normal_result {
-        Ok(status) if status.success() => {},
+        Ok(status) if status.success() => {}
         Ok(status) => exit(status.code().unwrap_or(1)),
         Err(e) => {
             eprintln!("Failed to execute normal compilation: {}", e);
@@ -895,7 +1284,7 @@ fn main() {
     if emit_llvmir_opt.is_none() {
         exit(0);
     }
-    
+
     let extra_opts: Vec<String> = if let Some(extra) = emit_llvmir_opt.as_deref() {
         if extra == "1" {
             Vec::new()
@@ -905,36 +1294,41 @@ fn main() {
     } else {
         Vec::new()
     };
-    
+
     let mut llvm_cmd = Command::new(&clang_path);
     llvm_cmd.args(&other_args);
-    
+
     for opt in &extra_opts {
         llvm_cmd.arg(opt);
     }
-    
+
     llvm_cmd.arg("-emit-llvm");
-    
+
     if let Some(ref input) = input_file {
         llvm_cmd.arg(input);
     }
-    
+
     let abs_output = get_absolute_path(&output_path);
-    
+
     let mut ir_path = PathBuf::from(&llvm_ir_dir);
-    let rel_output = abs_output.strip_prefix("/")
-        .unwrap_or(&abs_output);
+    let rel_output = abs_output.strip_prefix("/").unwrap_or(&abs_output);
     ir_path.push(rel_output);
-    
+
     let llvm_ir_path = ir_path;
-    
+
     if let Err(e) = ensure_dir_exists(&llvm_ir_path) {
-        debug_log(debug_mode, &format!("[DEBUG] Warning: Failed to create LLVM IR output directory: {}", e));
+        debug_log(
+            debug_mode,
+            &format!(
+                "[DEBUG] Warning: Failed to create LLVM IR output directory: {}",
+                e
+            ),
+        );
         exit(0);
     }
 
     let has_explicit_output = output_file.is_some() || input_file.is_some();
-    
+
     let (ir_output_path, use_tmp_file) = if has_explicit_output {
         (llvm_ir_path.clone(), false)
     } else {
@@ -955,20 +1349,39 @@ fn main() {
         }
         cmd_args.push("-o".to_string());
         cmd_args.push(ir_output_path.display().to_string());
-        debug_log(debug_mode, &format!("[DEBUG] LLVM IR generation: {} {}", clang_path.display(), cmd_args.join(" ")));
+        debug_log(
+            debug_mode,
+            &format!(
+                "[DEBUG] LLVM IR generation: {} {}",
+                clang_path.display(),
+                cmd_args.join(" ")
+            ),
+        );
     }
 
     let log_path = format!("{}_log", llvm_ir_path.display());
-    
+
     if let Err(e) = ensure_dir_exists(&PathBuf::from(&log_path)) {
-        debug_log(debug_mode, &format!("[DEBUG] Warning: Failed to create log file directory: {}", e));
+        debug_log(
+            debug_mode,
+            &format!(
+                "[DEBUG] Warning: Failed to create log file directory: {}",
+                e
+            ),
+        );
         exit(0);
     }
-    
+
     let mut log_file = match File::create(&log_path) {
         Ok(f) => f,
         Err(e) => {
-            debug_log(debug_mode, &format!("[DEBUG] Warning: Failed to create log file {}: {}", log_path, e));
+            debug_log(
+                debug_mode,
+                &format!(
+                    "[DEBUG] Warning: Failed to create log file {}: {}",
+                    log_path, e
+                ),
+            );
             exit(0);
         }
     };
@@ -984,7 +1397,7 @@ fn main() {
     }
     cmd_parts.push("-o".to_string());
     cmd_parts.push(ir_output_path.display().to_string());
-    
+
     let cmd_str = cmd_parts.join(" ");
     let _ = writeln!(log_file, "Command: {}", cmd_str);
 
@@ -998,8 +1411,12 @@ fn main() {
             if use_tmp_file {
                 if let Err(_e) = fs::rename(&ir_output_path, &llvm_ir_path) {
                     if let Err(copy_err) = fs::copy(&ir_output_path, &llvm_ir_path) {
-                        eprintln!("Warning: Failed to move temp LLVM IR file: {} -> {}: copy error: {}", 
-                                  ir_output_path.display(), llvm_ir_path.display(), copy_err);
+                        eprintln!(
+                            "Warning: Failed to move temp LLVM IR file: {} -> {}: copy error: {}",
+                            ir_output_path.display(),
+                            llvm_ir_path.display(),
+                            copy_err
+                        );
                         let _ = fs::remove_file(&ir_output_path);
                         exit(0);
                     }
@@ -1009,7 +1426,13 @@ fn main() {
             exit(0);
         }
         Ok(status) => {
-            debug_log(debug_mode, &format!("[DEBUG] LLVM IR generation failed, see {} for details", log_path));
+            debug_log(
+                debug_mode,
+                &format!(
+                    "[DEBUG] LLVM IR generation failed, see {} for details",
+                    log_path
+                ),
+            );
             let _ = fs::remove_file(&ir_output_path);
             // Remove the normal .o file as well since LLVM IR generation failed
             if output_path.exists() {
@@ -1018,7 +1441,13 @@ fn main() {
             exit(status.code().unwrap_or(1));
         }
         Err(e) => {
-            debug_log(debug_mode, &format!("[DEBUG] Warning: Failed to execute LLVM IR generation: {}", e));
+            debug_log(
+                debug_mode,
+                &format!(
+                    "[DEBUG] Warning: Failed to execute LLVM IR generation: {}",
+                    e
+                ),
+            );
             let _ = fs::remove_file(&ir_output_path);
             exit(0);
         }

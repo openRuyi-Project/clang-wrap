@@ -6,16 +6,24 @@ set -e
 
 # 构建和安装 clang-wrap
 build() {
-	rm -rf clang-wrap-install
-	cargo build --release
-	cargo install --path . --root clang-wrap-install
-	cd clang-wrap-install/bin
-	ln -sf clang clang++
-	ln -sf clang clang-22
-	ln -sf clang clang++-22
-	ln -sf ar llvm-ar
-	ln -sf ar x86_64-linux-gnu-ar
-	cd -
+	make clean-install
+	make install
+}
+
+# 执行指定目录中的所有 _cmd 脚本。
+# 注意：`bash *_cmd` 只会把第一个 _cmd 当作脚本执行，其余展开项会变成 $1/$2...
+# 因此必须显式循环逐个执行。
+run_llvmir_cmds() {
+	dir=$1
+	[ -d "$dir" ] || return 0
+	(
+		cd "$dir"
+		for cmd in *_cmd; do
+			[ -e "$cmd" ] || continue
+			echo "Running: $dir/$cmd ..."
+			bash "$cmd"
+		done
+	)
 }
 
 # 测试 libxml2
@@ -25,15 +33,17 @@ test_libxml2() {
 	export EMIT_LLVMIR=1
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/libxml2
-	cd testdeb/libxml2 && rm -rf libxml2*
-	apt-get source libxml2
-	cd libxml2-2*
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang-22 ../configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/libxml2
+		rm -rf libxml2*
+		apt-get source libxml2
+		cd libxml2-2*
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang-22 ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 # 测试 pcre2
@@ -43,15 +53,17 @@ test_pcre2() {
 	export EMIT_LLVMIR=1
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/pcre2
-	cd testdeb/pcre2 && rm -rf pcre2*
-	apt-get source pcre2
-	cd pcre2-*
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang ../configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/pcre2
+		rm -rf pcre2*
+		apt-get source pcre2
+		cd pcre2-*
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 # 测试 flex
@@ -61,16 +73,18 @@ test_flex() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/flex
-	cd testdeb/flex && rm -rf flex*
-	apt-get source flex
-	cd flex-*
-	dh_autoreconf
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang ../configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/flex
+		rm -rf flex*
+		apt-get source flex
+		cd flex-*
+		dh_autoreconf
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 # 测试 bamf
@@ -80,15 +94,17 @@ test_bamf() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/bamf
-	cd testdeb/bamf && rm -rf bamf*
-	apt-get source bamf
-	cd bamf-*
-	dh_autoreconf
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang ../configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	cd -
+	(
+		cd testdeb/bamf
+		rm -rf bamf*
+		apt-get source bamf
+		cd bamf-*
+		dh_autoreconf
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+	)
 }
 
 test_hesiod() {
@@ -98,18 +114,20 @@ test_hesiod() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	dh_autoreconf
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang-22 CXX=clang++-22 ../configure && \
-		CC=clang-22 CXX=clang++-22 make V=1 && \
-		make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		dh_autoreconf
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang-22 CXX=clang++-22 ../configure && \
+			CC=clang-22 CXX=clang++-22 make V=1 -j`nproc` && \
+			make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 test_hwloc() {
@@ -119,16 +137,18 @@ test_hwloc() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	dh_autoreconf
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang CXX=clang++ ../configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		dh_autoreconf
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang CXX=clang++ ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 test_identity4c() {
@@ -138,15 +158,17 @@ test_identity4c() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	dh_autoreconf
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang CXX=clang++ ../configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		dh_autoreconf
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang CXX=clang++ ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+	)
 }
 
 test_paps() {
@@ -156,16 +178,18 @@ test_paps() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	dh_autoreconf
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang CXX=clang++ ../configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		dh_autoreconf
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang CXX=clang++ ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 test_x264() {
@@ -175,15 +199,17 @@ test_x264() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang ../configure --enable-shared --disable-asm && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang ../configure --enable-shared --disable-asm && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 test_ffmpeg() {
@@ -193,16 +219,18 @@ test_ffmpeg() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	# ffmpeg 需要禁用汇编和一些可能有问题的组件
-	CC=clang CXX=clang++ ../configure --cc=clang --cxx=clang++ --enable-shared --disable-asm --disable-doc --disable-htmlpages --disable-manpages --disable-podpages --disable-txtpages && make V=1 && make install V=1 DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		# ffmpeg 需要禁用汇编和一些可能有问题的组件
+		CC=clang CXX=clang++ ../configure --cc=clang --cxx=clang++ --enable-shared --disable-asm --disable-doc --disable-htmlpages --disable-manpages --disable-podpages --disable-txtpages && make V=1 -j`nproc` && make install V=1 DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 test_sqlite3() {
@@ -212,15 +240,17 @@ test_sqlite3() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	mkdir -p build-with-clangwrap && cd build-with-clangwrap
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang CXX=clang++ ../configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang CXX=clang++ ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 test_libpcap() {
@@ -230,13 +260,15 @@ test_libpcap() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	rm -rf ~/tmp/llvmir/`pwd`
-	CC=clang CXX=clang++ ./configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang CXX=clang++ ./configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+	)
 }
 
 test_gsl() {
@@ -246,15 +278,17 @@ test_gsl() {
 	export EMIT_LLVMIR=-march=native
 	export PATH=`pwd`/clang-wrap-install/bin:$PATH
 	mkdir -p testdeb/$pkg
-	cd testdeb/$pkg && rm -rf ${pkg}*
-	apt-get source $pkg
-	cd ${pkg}-*
-	rm -rf ~/tmp/llvmir/`pwd`
-	AUTOMAKE=automake ACLOCAL=aclocal dh_autoreconf
-	CC=clang CXX=clang++ ./configure && make V=1 && make install DESTDIR=`pwd`/install
-	(cd install/usr/local/lib/llvmir && bash *_cmd)
-	(cd install/usr/local/lib/llvmir-bin && bash *_cmd)
-	cd -
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		rm -rf ~/tmp/llvmir/`pwd`
+		AUTOMAKE=automake ACLOCAL=aclocal dh_autoreconf
+		CC=clang CXX=clang++ ./configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
 }
 
 # 显示帮助信息
