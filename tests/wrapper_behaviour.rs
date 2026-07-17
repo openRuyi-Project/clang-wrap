@@ -244,7 +244,7 @@ fn generated_cmd_script_handles_spaces_without_eval() {
         .current_dir(root)
         .env("EMIT_LLVMIR", "1")
         .env("LLVM_IR_DIR", &llvmir_dir)
-        .args(["hello space.c", "-o", "hello space"])
+        .args(["hello space.c", "-ffat-lto-objects", "-o", "hello space"])
         .status()
         .expect("failed to execute clang wrapper");
     assert!(status.success(), "clang wrapper failed with {status}");
@@ -258,6 +258,7 @@ fn generated_cmd_script_handles_spaces_without_eval() {
     assert!(script.contains("\"${cmd[@]}\""));
     assert!(!script.contains("_try_bc"));
     assert!(!script.contains("substituted_cmd"));
+    assert!(!script.contains("-ffat-lto-objects"));
     assert!(script.contains("--output=output/hello space"));
     assert!(!script.lines().any(|line| line.trim() == "-o"));
 

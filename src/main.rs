@@ -882,7 +882,7 @@ fn generate_link_cmd_file(
             continue;
         }
 
-        if arg == "-c" || arg == "-emit-llvm" || arg == "-shared" {
+        if arg == "-c" || arg == "-emit-llvm" || arg == "-shared" || arg == "-ffat-lto-objects" {
             continue;
         }
         if is_rpath_arg(arg) {
