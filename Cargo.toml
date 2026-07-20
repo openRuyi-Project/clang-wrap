@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 pathdiff = "0.2"
+serde_json = "1"
 
 [[bin]]
 name = "clang"
@@ -33,3 +34,7 @@ path = "src/bin/cp-wrap.rs"
 [[bin]]
 name = "strip"
 path = "src/bin/strip-wrap.rs"
+
+[[bin]]
+name = "meson-install"
+path = "src/bin/meson-install.rs"

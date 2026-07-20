@@ -6,6 +6,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::json;
+
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 struct TestDir {
@@ -47,6 +49,7 @@ fn bin(name: &str) -> &'static str {
         "cp" => env!("CARGO_BIN_EXE_cp"),
         "install" => env!("CARGO_BIN_EXE_install"),
         "ln" => env!("CARGO_BIN_EXE_ln"),
+        "meson-install" => env!("CARGO_BIN_EXE_meson-install"),
         "mv" => env!("CARGO_BIN_EXE_mv"),
         other => panic!("unknown test binary: {other}"),
     }
@@ -75,6 +78,17 @@ fn run_wrapper(binary: &str, cwd: &Path, llvmir_dir: &Path, args: &[&str]) {
         .status()
         .expect("failed to execute wrapper binary");
     assert!(status.success(), "{binary} wrapper failed with {status}");
+}
+
+fn run_meson_install(cwd: &Path, llvmir_dir: &Path, manifest: &Path, destdir: &Path) {
+    let status = Command::new(bin("meson-install"))
+        .current_dir(cwd)
+        .env("LLVM_IR_DIR", llvmir_dir)
+        .arg(manifest)
+        .arg(destdir)
+        .status()
+        .expect("failed to execute meson-install");
+    assert!(status.success(), "meson-install failed with {status}");
 }
 
 fn command_exists(command: &str) -> bool {
@@ -222,6 +236,67 @@ fn install_shared_library_temp_t_uses_soname_for_installed_ir() {
     assert!(script.contains("# Original output: libdemo.so.1"));
     assert!(script.contains("./libdemo.so.1"));
     assert!(script.contains("--output=output/libdemo.so.1"));
+}
+
+#[test]
+fn meson_install_uses_manifest_and_destdir_to_sync_llvmir_files() {
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let destdir = root.join("image");
+    let library = root.join("build/libdemo.so.1.2.3");
+    let executable = root.join("build/demo");
+    let header = root.join("include/demo.h");
+    let library_ir = llvmir_path(&llvmir_dir, &library);
+
+    write_file(&library, "shared-library-placeholder");
+    write_file(&library_ir, "bitcode");
+    write_file(
+        &PathBuf::from(format!("{}_cmd", library_ir.display())),
+        "#!/bin/bash\n# Original output: libdemo.so.1.2.3\nclang -Wl,-soname,libdemo.so.1 ./libdemo.so.1.2.3 -Wl,--version-script=./libdemo.so.1.2.3_verscript\n",
+    );
+    write_file(
+        &PathBuf::from(format!("{}_verscript", library_ir.display())),
+        "LIBDEMO_1 { global: demo; };\n",
+    );
+    write_file(
+        &PathBuf::from(format!("{}_log", library_ir.display())),
+        "llvm-link log\n",
+    );
+    write_file(&executable, "executable-placeholder");
+    write_file(
+        &llvmir_path(&llvmir_dir, &executable).with_extension("bc"),
+        "executable-bitcode",
+    );
+    write_file(&header, "#pragma once\n");
+
+    let manifest = root.join("intro-installed.json");
+    write_file(
+        &manifest,
+        &json!({
+            library.to_string_lossy(): "/usr/lib/libdemo.so.1.2.3",
+            executable.to_string_lossy(): "/usr/bin/demo",
+            header.to_string_lossy(): "/usr/include/demo.h",
+            "libdemo.so.1": "/usr/lib/libdemo.so.1",
+        })
+        .to_string(),
+    );
+
+    run_meson_install(root, &llvmir_dir, &manifest, &destdir);
+
+    let llvmir_lib_dir = destdir.join("usr/lib/llvmir");
+    assert!(llvmir_lib_dir.join("libdemo.so.1").exists());
+    assert!(llvmir_lib_dir.join("libdemo.so.1_cmd").exists());
+    assert!(llvmir_lib_dir.join("libdemo.so.1_verscript").exists());
+    assert!(!llvmir_lib_dir.join("libdemo.so.1_log").exists());
+    assert!(!llvmir_lib_dir.join("libdemo.so.1.2.3").exists());
+    let cmd = fs::read_to_string(llvmir_lib_dir.join("libdemo.so.1_cmd"))
+        .expect("failed to read installed cmd file");
+    assert!(cmd.contains("# Original output: libdemo.so.1"));
+    assert!(cmd.contains("./libdemo.so.1"));
+    assert!(cmd.contains("libdemo.so.1_verscript"));
+    assert!(destdir.join("usr/lib/llvmir-bin/demo.bc").exists());
+    assert!(!destdir.join("usr/include/llvmir/demo.h").exists());
 }
 
 #[test]

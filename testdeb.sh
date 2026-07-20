@@ -291,6 +291,29 @@ test_gsl() {
 	)
 }
 
+# 测试 pixman（Meson 构建与安装）
+test_pixman() {
+	pkg=pixman
+	export CLANG_WRAP_DEBUG=1
+	export EMIT_LLVMIR=-march=native
+	export PATH=`pwd`/clang-wrap-install/bin:$PATH
+	mkdir -p testdeb/$pkg
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang CXX=clang++ AR=ar meson setup --prefix=/usr . ..
+		meson compile -C . -j`nproc`
+		meson install -C . --destdir=`pwd`/install
+		meson-install meson-info/intro-installed.json `pwd`/install
+		run_llvmir_cmds install/usr/lib/llvmir
+		run_llvmir_cmds install/usr/lib/llvmir-bin
+	)
+}
+
 # 显示帮助信息
 show_help() {
 	echo "用法: $0 [命令]"
@@ -310,6 +333,7 @@ show_help() {
 	echo "  sqlite3      - 测试 sqlite3 包"
 	echo "  libpcap      - 测试 libpcap 包"
 	echo "  gsl          - 测试 gsl 包"
+	echo "  pixman       - 测试 pixman 包（Meson）"
 	echo "  all          - 构建并测试所有包"
 	echo "  help         - 显示此帮助信息"
 	echo ""
@@ -361,6 +385,9 @@ main() {
 		gsl)
 			test_gsl
 			;;
+		pixman)
+			test_pixman
+			;;
 		all)
 			build
 			test_libxml2
@@ -376,6 +403,7 @@ main() {
 			test_sqlite3
 			test_libpcap
 			test_gsl
+			test_pixman
 			;;
 		help|-h|--help)
 			show_help

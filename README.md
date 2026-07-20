@@ -48,6 +48,10 @@ SPDX-License-Identifier: MulanPSL-2.0
 - **strip-wrap** (`src/bin/strip-wrap.rs`): strip wrapper
   - Handles LLVM IR file copying during strip operations
 
+- **meson-install** (`src/bin/meson-install.rs`): Meson installation companion
+  - Parses Meson's `intro-installed.json` directly
+  - Installs LLVM IR and related `_cmd` and `_verscript` files into a Meson `destdir`
+
 ### Common Library
 
 - **lib.rs** (`src/lib.rs`): Shared functionality including:
@@ -98,6 +102,33 @@ Once installed, the wrappers work transparently. Set `EMIT_LLVMIR=1` to enable L
 ```bash
 EMIT_LLVMIR=1 make
 ```
+
+### Meson
+
+Meson uses its own internal installation implementation, so the `install` wrapper does not
+observe `meson install`. Build normally with the compiler wrappers in `PATH`, then invoke
+`meson-install` after Meson has populated the staging directory:
+
+```bash
+export PATH="$PWD/clang-wrap-install/bin:$PATH"
+export EMIT_LLVMIR=1
+export LLVM_IR_DIR="$PWD/llvmir"
+export CC=clang
+export CXX=clang++
+export AR=ar
+
+meson setup build
+meson compile -C build
+meson install -C build --destdir "$PWD/image"
+meson-install build/meson-info/intro-installed.json "$PWD/image"
+```
+
+`meson-install` takes exactly two arguments: the path to Meson's
+`intro-installed.json` and the same `destdir` supplied to `meson install`. The JSON is parsed
+internally as a map from build product paths to configured absolute installation paths. For each
+entry that has LLVM IR in `LLVM_IR_DIR`, it copies the bitcode, `_cmd`, and `_verscript` files to
+the staging tree, using the same target layout and shared-library SONAME rewriting as the `install`
+wrapper. Build logs (`_log`) remain only in `LLVM_IR_DIR` and are not installed.
 
 ## License
 

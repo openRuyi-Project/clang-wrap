@@ -5,7 +5,7 @@ SHELL := /bin/bash
 PREFIX ?= $(CURDIR)/clang-wrap-install
 BINDIR := $(PREFIX)/bin
 RELEASE_DIR := target/release
-WRAPPERS := clang ar install ln mv cp strip
+WRAPPERS := clang ar install ln mv cp strip meson-install
 INSTALL ?= /usr/bin/install
 
 .PHONY: all build install install-binaries install-links clean-install test clippy fmt-check

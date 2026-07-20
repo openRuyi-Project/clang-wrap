@@ -12,6 +12,8 @@
 //! - LLVM IR path calculation
 //! - Finding related files (_log, _cmd, _verscript)
 
+pub mod install;
+
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
