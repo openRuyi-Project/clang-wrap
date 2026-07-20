@@ -259,6 +259,7 @@ fn generated_cmd_script_handles_spaces_without_eval() {
     assert!(!script.contains("_try_bc"));
     assert!(!script.contains("substituted_cmd"));
     assert!(!script.contains("-ffat-lto-objects"));
+    assert!(script.lines().any(|line| line.trim() == "-O3"));
     assert!(script.contains("--output=output/hello space"));
     assert!(!script.lines().any(|line| line.trim() == "-o"));
 
@@ -380,6 +381,7 @@ fn generated_cmd_script_expands_dash_l_to_real_library_path() {
         .arg(&lib_dir)
         .arg("-lwrapdep")
         .arg(&symlink_cblas_lib)
+        .arg("-O1")
         .arg("-Wl,-rpath,/tmp/drop-rpath-comma")
         .arg("-Wl,-rpath=/tmp/drop-rpath-equals")
         .arg("-Wl,--rpath,/tmp/drop-rpath-long")
@@ -429,6 +431,14 @@ fn generated_cmd_script_expands_dash_l_to_real_library_path() {
     assert!(
         !script.lines().any(|line| line.trim() == "-o"),
         "generated _cmd should not use split -o output syntax"
+    );
+    assert!(
+        script.lines().any(|line| line.trim() == "-O1"),
+        "generated _cmd should retain the requested optimization level"
+    );
+    assert!(
+        !script.lines().any(|line| line.trim() == "-O3"),
+        "generated _cmd should not add -O3 when an optimization level is specified"
     );
     assert!(
         !script.lines().any(|line| line.trim() == "-lwrapdep"),

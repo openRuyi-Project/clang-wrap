@@ -372,6 +372,13 @@ fn rpath_arg_consumes_next(arg: &str) -> bool {
     matches!(arg, "-rpath" | "--rpath" | "-Wl,-rpath" | "-Wl,--rpath")
 }
 
+fn is_optimization_level_arg(arg: &str) -> bool {
+    matches!(arg, "-O" | "-Ofast" | "-Og" | "-Os" | "-Oz")
+        || arg.strip_prefix("-O").is_some_and(|level| {
+            !level.is_empty() && level.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
 /// Handle link command (generate executable or shared library)
 fn handle_link_command(
     clang_path: &Path,
@@ -874,6 +881,14 @@ fn generate_link_cmd_file(
     push_array_arg(&mut script, "-x");
     push_array_arg(&mut script, "ir");
     push_array_arg(&mut script, "-fuse-ld=lld");
+
+    let has_optimization_level = other_args
+        .iter()
+        .chain(link_flags)
+        .any(|arg| is_optimization_level_arg(arg));
+    if !has_optimization_level {
+        push_array_arg(&mut script, "-O3");
+    }
 
     let mut skip_next = false;
     for arg in other_args {
