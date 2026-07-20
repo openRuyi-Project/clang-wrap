@@ -506,7 +506,7 @@ fn link_executable_merges_explicit_static_library_ir() {
         .current_dir(root)
         .env("EMIT_LLVMIR", "1")
         .env("LLVM_IR_DIR", &llvmir_dir)
-        .args(["cr", "libutil.a", "util.o"])
+        .args(["csrDT", "libutil.a", "util.o"])
         .status()
         .expect("failed to archive libutil.a with ar wrapper");
     assert!(archive.success(), "ar wrapper failed with {archive}");

@@ -78,8 +78,8 @@ fn main() {
             }
         } else if archive_file.is_none() {
             // First non-option argument
-            let is_bsd_option = arg.chars().all(|c| c.is_ascii_lowercase())
-                && arg.len() <= 5
+            let is_bsd_option = arg.chars().all(|c| c.is_ascii_alphabetic())
+                && arg.len() <= 8
                 && (arg.contains('c') || arg.contains('r'));
 
             if is_bsd_option {
