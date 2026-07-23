@@ -1,0 +1,1 @@
+int fixture_dependency_value(void) { return 23; }

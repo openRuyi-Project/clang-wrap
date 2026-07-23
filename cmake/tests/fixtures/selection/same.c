@@ -1,0 +1,1 @@
+int same_c(void) { return 1; }

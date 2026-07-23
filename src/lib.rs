@@ -281,6 +281,7 @@ pub enum AuxFileSuffix {
     Log,
     Cmd,
     Verscript,
+    Missing,
 }
 
 impl AuxFileSuffix {
@@ -289,6 +290,7 @@ impl AuxFileSuffix {
             AuxFileSuffix::Log => "_log",
             AuxFileSuffix::Cmd => "_cmd",
             AuxFileSuffix::Verscript => "_verscript",
+            AuxFileSuffix::Missing => "_missing",
         }
     }
 }
@@ -318,12 +320,13 @@ pub fn find_verscript_file(file_path: &Path) -> Option<PathBuf> {
     find_aux_file(file_path, AuxFileSuffix::Verscript)
 }
 
-/// Find all related auxiliary files (_log, _cmd, _verscript)
+/// Find all related auxiliary files (_log, _cmd, _verscript, _missing)
 pub fn find_all_aux_files(file_path: &Path) -> Vec<(AuxFileSuffix, PathBuf)> {
     [
         AuxFileSuffix::Log,
         AuxFileSuffix::Cmd,
         AuxFileSuffix::Verscript,
+        AuxFileSuffix::Missing,
     ]
     .iter()
     .filter_map(|&suffix| find_aux_file(file_path, suffix).map(|p| (suffix, p)))
@@ -648,7 +651,7 @@ pub fn shell_escape(s: &str) -> String {
 // @file argument expansion
 // ============================================================================
 
-fn split_response_args(content: &str) -> Vec<String> {
+fn split_response_args(content: &str) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut chars = content.chars().peekable();
@@ -683,38 +686,131 @@ fn split_response_args(content: &str) -> Vec<String> {
         args.push(current);
     }
 
-    args
-}
-
-/// Expand @file arguments
-/// @file syntax reads arguments from file, one per line
-pub fn expand_at_file_args(args: &[String], debug_mode: bool) -> Vec<String> {
-    let mut expanded_args: Vec<String> = Vec::new();
-
-    for arg in args {
-        if let Some(file_path) = arg.strip_prefix('@') {
-            // Get file path (remove @ prefix)
-            match fs::read_to_string(file_path) {
-                Ok(content) => {
-                    let parsed_args = split_response_args(&content);
-                    let args_read = parsed_args.len();
-                    expanded_args.extend(parsed_args);
-
-                    debug_log(
-                        debug_mode,
-                        &format!("[DEBUG] Expanded @{}: {} arguments", file_path, args_read),
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to open @file '{}': {}", file_path, e);
-                    // If file doesn't exist, keep original argument
-                    expanded_args.push(arg.clone());
-                }
-            }
-        } else {
-            expanded_args.push(arg.clone());
-        }
+    if in_single_quote || in_double_quote {
+        return Err("unterminated quote".to_string());
     }
 
-    expanded_args
+    Ok(args)
+}
+
+fn expand_response_args(
+    args: &[String],
+    base_dir: &Path,
+    active_files: &mut Vec<PathBuf>,
+    depth: usize,
+    debug_mode: bool,
+) -> Result<Vec<String>, String> {
+    if depth > 32 {
+        return Err("response-file nesting exceeds 32 levels".to_string());
+    }
+
+    let mut expanded_args = Vec::new();
+    for arg in args {
+        if let Some(literal) = arg.strip_prefix("@@") {
+            expanded_args.push(format!("@{literal}"));
+            continue;
+        }
+        let Some(file_path) = arg.strip_prefix('@') else {
+            expanded_args.push(arg.clone());
+            continue;
+        };
+        if file_path.is_empty() {
+            return Err("empty response-file argument".to_string());
+        }
+        let path = Path::new(file_path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(path)
+        };
+        let path = path.canonicalize().map_err(|error| {
+            format!("failed to open response file '{}': {error}", path.display())
+        })?;
+        if active_files.contains(&path) {
+            return Err(format!(
+                "response-file inclusion cycle detected at {}",
+                path.display()
+            ));
+        }
+        let content = fs::read_to_string(&path).map_err(|error| {
+            format!("failed to read response file '{}': {error}", path.display())
+        })?;
+        let parsed_args = split_response_args(&content)
+            .map_err(|error| format!("invalid response file '{}': {error}", path.display()))?;
+        debug_log(
+            debug_mode,
+            &format!(
+                "[DEBUG] Expanded @{}: {} arguments",
+                path.display(),
+                parsed_args.len()
+            ),
+        );
+        active_files.push(path.clone());
+        let parent = path.parent().unwrap_or(base_dir);
+        expanded_args.extend(expand_response_args(
+            &parsed_args,
+            parent,
+            active_files,
+            depth + 1,
+            debug_mode,
+        )?);
+        active_files.pop();
+    }
+    Ok(expanded_args)
+}
+
+/// Expand Clang/GNU-style @response-file arguments recursively.
+pub fn expand_at_file_args(args: &[String], debug_mode: bool) -> Result<Vec<String>, String> {
+    let base_dir = env::current_dir()
+        .map_err(|error| format!("failed to determine response-file base directory: {error}"))?;
+    expand_response_args(args, &base_dir, &mut Vec::new(), 0, debug_mode)
+}
+
+#[cfg(test)]
+mod response_file_tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("clang-wrap-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("failed to create response-file test directory");
+        path
+    }
+
+    #[test]
+    fn response_files_expand_recursively_relative_to_their_parent() {
+        let root = test_dir("response-nested");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("outer.rsp"), "@nested/inner.rsp -o app\n").unwrap();
+        fs::write(nested.join("inner.rsp"), "'-DNAME=two words' @@literal\n").unwrap();
+
+        let args = vec!["clang".to_string(), "@outer.rsp".to_string()];
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(&root).unwrap();
+        let expanded = expand_at_file_args(&args, false);
+        env::set_current_dir(original_dir).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            expanded.unwrap(),
+            vec!["clang", "-DNAME=two words", "@literal", "-o", "app"]
+        );
+    }
+
+    #[test]
+    fn response_file_cycles_are_rejected() {
+        let root = test_dir("response-cycle");
+        fs::write(root.join("first.rsp"), "@second.rsp\n").unwrap();
+        fs::write(root.join("second.rsp"), "@first.rsp\n").unwrap();
+
+        let args = vec!["clang".to_string(), "@first.rsp".to_string()];
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(&root).unwrap();
+        let error = expand_at_file_args(&args, false).unwrap_err();
+        env::set_current_dir(original_dir).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(error.contains("inclusion cycle"));
+    }
 }

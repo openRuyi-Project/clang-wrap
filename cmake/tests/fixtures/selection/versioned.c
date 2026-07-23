@@ -1,0 +1,1 @@
+int fixture_exported_symbol(void) { return 5; }

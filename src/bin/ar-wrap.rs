@@ -5,10 +5,11 @@
 
 //! ar/llvm-ar wrapper
 //!
-//! After executing ar command, automatically invoke llvm-link to merge LLVM IR files
+//! After executing ar command, automatically create a matching LLVM IR archive.
 
 use std::env;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{exit, Command, Stdio};
 
@@ -109,8 +110,11 @@ fn main() {
         exit(0);
     }
 
-    // Find LLVM IR files corresponding to .o files
+    // Find LLVM IR files corresponding to .o files. The LLVM archive must only
+    // contain bitcode members: llvm-link rejects an archive that contains a
+    // native object, so missing IR members are recorded in a sidecar instead.
     let mut llvm_ir_files: Vec<PathBuf> = Vec::new();
+    let mut missing_ir_files: Vec<PathBuf> = Vec::new();
 
     for obj_file in &member_files {
         if !obj_file.extension().map(|e| e == "o").unwrap_or(false) {
@@ -120,6 +124,14 @@ fn main() {
         if let Some(ir_path) = find_llvmir_file(obj_file, &llvm_ir_dir) {
             llvm_ir_files.push(ir_path);
         } else {
+            let missing_path = if obj_file.is_absolute() {
+                obj_file.clone()
+            } else {
+                env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(obj_file)
+            };
+            missing_ir_files.push(missing_path);
             debug_log(
                 debug,
                 &format!(
@@ -128,11 +140,6 @@ fn main() {
                 ),
             );
         }
-    }
-
-    if llvm_ir_files.is_empty() {
-        debug_log(debug, "[DEBUG] No LLVM IR files found, skipping llvm-link");
-        exit(0);
     }
 
     // Get absolute path of archive file
@@ -147,27 +154,58 @@ fn main() {
             }
         }
         None => {
-            debug_log(
-                debug,
-                "[DEBUG] No archive file specified, skipping llvm-link",
-            );
+            debug_log(debug, "[DEBUG] No archive file specified, skipping llvm-ar");
             exit(0);
         }
     };
 
-    // Build llvm-link output path
-    let mut llvm_link_output = PathBuf::from(&llvm_ir_dir);
+    let mut llvm_archive_output = PathBuf::from(&llvm_ir_dir);
     let rel_output = archive_path.strip_prefix("/").unwrap_or(&archive_path);
-    llvm_link_output.push(rel_output);
+    llvm_archive_output.push(rel_output);
 
-    // Ensure output directory exists
-    if let Err(e) = ensure_dir_exists(&llvm_link_output) {
+    if let Err(e) = ensure_dir_exists(&llvm_archive_output) {
         eprintln!("Failed to create LLVM IR output directory: {}", e);
         exit(1);
     }
 
-    // Find llvm-link
-    // Prefer using CC or CXX environment variable to determine llvm-link version
+    let missing_path = PathBuf::from(format!("{}_missing", llvm_archive_output.display()));
+    if missing_ir_files.is_empty() {
+        if let Err(e) = fs::remove_file(&missing_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Failed to remove LLVM IR missing-member file: {}", e);
+                exit(1);
+            }
+        }
+    } else {
+        let mut missing_file = match File::create(&missing_path) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!(
+                    "Failed to create LLVM IR missing-member file {}: {}",
+                    missing_path.display(),
+                    e
+                );
+                exit(1);
+            }
+        };
+        for missing in &missing_ir_files {
+            if let Err(e) = writeln!(missing_file, "{}", missing.display()) {
+                eprintln!(
+                    "Failed to write LLVM IR missing-member file {}: {}",
+                    missing_path.display(),
+                    e
+                );
+                exit(1);
+            }
+        }
+    }
+
+    if llvm_ir_files.is_empty() {
+        debug_log(debug, "[DEBUG] No LLVM IR files found, skipping llvm-ar");
+        exit(0);
+    }
+
+    // Prefer using CC or CXX environment variable to determine llvm-ar version.
     let clang_cmd_for_version = env::var("CC")
         .ok()
         .filter(|s| !s.is_empty())
@@ -182,12 +220,12 @@ fn main() {
         })
         .unwrap_or_else(|| ar_cmd.to_string());
 
-    let llvm_link_path = find_llvm_tool("llvm-link", &clang_cmd_for_version);
+    let llvm_ar_path = find_llvm_tool("llvm-ar", &clang_cmd_for_version);
 
     debug_log(
         debug,
         &format!(
-            "[DEBUG] Using clang cmd for llvm-link version: {}",
+            "[DEBUG] Using clang cmd for llvm-ar version: {}",
             clang_cmd_for_version
         ),
     );
@@ -195,9 +233,9 @@ fn main() {
     debug_log(
         debug,
         &format!(
-            "[DEBUG] llvm-link: {} -o {} {}",
-            llvm_link_path.display(),
-            llvm_link_output.display(),
+            "[DEBUG] llvm-ar: {} rcsD {} {}",
+            llvm_ar_path.display(),
+            llvm_archive_output.display(),
             llvm_ir_files
                 .iter()
                 .map(|f| f.display().to_string())
@@ -206,16 +244,15 @@ fn main() {
         ),
     );
 
-    // Build llvm-link command
-    let mut llvm_link_cmd = Command::new(&llvm_link_path);
-    llvm_link_cmd.arg("-o").arg(&llvm_link_output);
+    let mut llvm_ar_cmd = Command::new(&llvm_ar_path);
+    llvm_ar_cmd.arg("rcsD").arg(&llvm_archive_output);
 
     for ir_file in &llvm_ir_files {
-        llvm_link_cmd.arg(ir_file);
+        llvm_ar_cmd.arg(ir_file);
     }
 
     // Create log file
-    let log_path = format!("{}_log", llvm_link_output.display());
+    let log_path = format!("{}_log", llvm_archive_output.display());
     if let Err(e) = ensure_dir_exists(&PathBuf::from(&log_path)) {
         eprintln!("Failed to create log file directory: {}", e);
         exit(1);
@@ -229,29 +266,29 @@ fn main() {
         }
     };
 
-    // Redirect stdout and stderr to log file
-    llvm_link_cmd.stdout(Stdio::from(log_file.try_clone().unwrap()));
-    llvm_link_cmd.stderr(Stdio::from(log_file));
+    // Redirect stdout and stderr to log file.
+    llvm_ar_cmd.stdout(Stdio::from(log_file.try_clone().unwrap()));
+    llvm_ar_cmd.stderr(Stdio::from(log_file));
 
-    let llvm_link_result = llvm_link_cmd.status();
+    let llvm_ar_result = llvm_ar_cmd.status();
 
-    match llvm_link_result {
+    match llvm_ar_result {
         Ok(status) if status.success() => {
             debug_log(
                 debug,
                 &format!(
-                    "[DEBUG] llvm-link succeeded, output: {}",
-                    llvm_link_output.display()
+                    "[DEBUG] llvm-ar succeeded, output: {}",
+                    llvm_archive_output.display()
                 ),
             );
             exit(0);
         }
         Ok(status) => {
-            eprintln!("llvm-link failed, see {} for details", log_path);
+            eprintln!("llvm-ar failed, see {} for details", log_path);
             exit(status.code().unwrap_or(1));
         }
         Err(e) => {
-            eprintln!("Failed to execute llvm-link: {}", e);
+            eprintln!("Failed to execute llvm-ar: {}", e);
             exit(1);
         }
     }

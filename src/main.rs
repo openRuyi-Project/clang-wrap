@@ -13,6 +13,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 
+use goblin::elf::Elf;
+
 use clang_wrap::{
     append_tmp_suffix, debug_log, ensure_dir_exists, expand_at_file_args, find_llvm_tool,
     find_llvmir_file, generate_tmp_suffix, get_absolute_path, get_emit_llvmir_opt, get_exe_path,
@@ -73,6 +75,18 @@ fn precise_usr_bin_clang_path(clang_path: &Path, clang_version: &str) -> PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-{prefix}-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn clang_major_version_parses_common_version_lines() {
@@ -110,6 +124,303 @@ mod tests {
             ),
             PathBuf::from("/opt/llvm/bin/clang")
         );
+    }
+
+    #[test]
+    fn nonportable_linker_path_options_are_detected_in_all_supported_spellings() {
+        for args in [
+            vec!["--sysroot", "/build/sysroot"],
+            vec!["-Wl,-T,/build/layout.ld"],
+            vec!["-Wl,/build/opaque-linker-input.o"],
+            vec!["-Xlinker", "--sysroot=/build/sysroot"],
+            vec!["-Xlinker", "-T/build/layout.ld"],
+            vec!["-Xlinker", "/build/opaque-linker-input.o"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(has_nonportable_linker_path_option(&args), "{args:?}");
+        }
+
+        let frontend_only = vec!["-isysroot".to_string(), "/build/sysroot".to_string()];
+        assert!(!has_nonportable_linker_path_option(&frontend_only));
+
+        for args in [
+            vec!["-Wl,--start-group", "-lfoo", "-Wl,--end-group"],
+            vec!["-Wl,--whole-archive", "-lfoo", "-Wl,--no-whole-archive"],
+            vec!["-Xlinker", "--as-needed"],
+            vec!["-Wl,-rpath", "-Wl,/private/build/.libs"],
+            vec!["-Wl,-rpath,/private/build/.libs"],
+            vec!["-Wl,-rpath-link,/build/lib"],
+            vec!["-rpath-link", "/build/lib"],
+            vec!["-Xlinker", "-rpath-link", "-Xlinker", "/build/lib"],
+            vec!["-Xlinker", "--rpath-link=/build/lib"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(!has_nonportable_linker_path_option(&args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn rejected_linker_paths_fail_without_creating_cmd_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-cmd-reject-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bitcode = dir.join("program.bc");
+        let args = vec![
+            "program.o".to_string(),
+            "-Xlinker".to_string(),
+            "-T".to_string(),
+            "-Xlinker".to_string(),
+            "/private/build/linker-script.ld".to_string(),
+        ];
+
+        let error = generate_link_cmd_file(
+            Path::new("/bin/false"),
+            &bitcode,
+            Path::new("program"),
+            &args,
+            &[],
+            false,
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!PathBuf::from(format!("{}_cmd", bitcode.display())).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compiler_only_options_are_omitted_from_cmd_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-cmd-frontend-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bitcode = dir.join("program.bc");
+        let args = vec![
+            "program.o".to_string(),
+            "-isysroot".to_string(),
+            "/private/build/sysroot".to_string(),
+            "-I/private/build/include".to_string(),
+            "-Xclang".to_string(),
+            "-ast-dump".to_string(),
+        ];
+
+        generate_link_cmd_file(
+            Path::new("/bin/false"),
+            &bitcode,
+            Path::new("program"),
+            &args,
+            &[],
+            false,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let script = fs::read_to_string(format!("{}_cmd", bitcode.display())).unwrap();
+        for value in [
+            "-isysroot",
+            "/private/build/sysroot",
+            "-I/private/build/include",
+            "-Xclang",
+            "-ast-dump",
+        ] {
+            assert!(!script.contains(value), "script leaked {value}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn absolute_rpath_is_omitted_without_rejecting_cmd_generation() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-cmd-rpath-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bitcode = dir.join("program.bc");
+        let rpath = "/private/build/.libs";
+        let args = vec![
+            "program.o".to_string(),
+            "-Wl,-rpath".to_string(),
+            format!("-Wl,{rpath}"),
+        ];
+
+        generate_link_cmd_file(
+            Path::new("/bin/false"),
+            &bitcode,
+            Path::new("program"),
+            &args,
+            &[],
+            false,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let script = fs::read_to_string(format!("{}_cmd", bitcode.display())).unwrap();
+        assert!(!script.contains(rpath));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn split_version_script_option_is_rewritten_to_installed_sidecar() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-cmd-verscript-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bitcode = dir.join("program.bc");
+        let args = vec![
+            "program.o".to_string(),
+            "-Wl,-version-script".to_string(),
+            "-Wl,.libs/program.ver".to_string(),
+        ];
+
+        generate_link_cmd_file(
+            Path::new("/bin/false"),
+            &bitcode,
+            Path::new("program"),
+            &args,
+            &[],
+            false,
+            Some(Path::new("/artifact/program_verscript")),
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let script = fs::read_to_string(format!("{}_cmd", bitcode.display())).unwrap();
+        assert!(script.contains("-Wl,--version-script=./program_verscript"));
+        assert!(!script.contains(".libs/program.ver"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cmd_searches_parent_install_library_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-cmd-parent-lib-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bitcode = dir.join("program.bc");
+
+        generate_link_cmd_file(
+            Path::new("/bin/false"),
+            &bitcode,
+            Path::new("program"),
+            &["program.o".to_string(), "-l:libproject.so.0".to_string()],
+            &[],
+            false,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let script = fs::read_to_string(format!("{}_cmd", bitcode.display())).unwrap();
+        assert!(script.contains("  -L..\n"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dependency_file_options_are_omitted_from_cmd_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-cmd-dependency-file-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bitcode = dir.join("program.bc");
+        let args = vec![
+            "program.o".to_string(),
+            "-Xlinker".to_string(),
+            "--dependency-file=CMakeFiles/program.dir/link.d".to_string(),
+            "-Xlinker".to_string(),
+            "--dependency-file".to_string(),
+            "-Xlinker".to_string(),
+            "CMakeFiles/program.dir/split-link.d".to_string(),
+            "-Wl,--dependency-file,CMakeFiles/program.dir/wl-link.d".to_string(),
+        ];
+
+        generate_link_cmd_file(
+            Path::new("/bin/false"),
+            &bitcode,
+            Path::new("program"),
+            &args,
+            &[],
+            false,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let script = fs::read_to_string(format!("{}_cmd", bitcode.display())).unwrap();
+        assert!(!script.contains("dependency-file"));
+        assert!(!script.contains("link.d"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn static_archives_are_repeatedly_linked_with_only_needed() {
+        let dir = unique_temp_dir("llvm-link-archive-selection");
+        let linker = dir.join("fake-llvm-link");
+        let invocation_log = dir.join("invocations");
+        let output = dir.join("merged.bc");
+        let direct = dir.join("main.bc");
+        let archive_a = dir.join("liba.a");
+        let archive_b = dir.join("libb.a");
+        let log_file = File::create(dir.join("merge.log")).unwrap();
+        fs::write(&direct, "direct").unwrap();
+        fs::write(&archive_a, "archive a").unwrap();
+        fs::write(&archive_b, "archive b").unwrap();
+        fs::write(
+            &linker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\nprintf merged > \"$out\"\n",
+                invocation_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&linker).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&linker, permissions).unwrap();
+
+        merge_llvm_ir(
+            &linker,
+            &output,
+            std::slice::from_ref(&direct),
+            &[archive_a.clone(), archive_b.clone()],
+            &log_file,
+        )
+        .unwrap();
+
+        let invocations = fs::read_to_string(&invocation_log).unwrap();
+        let lines = invocations.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{invocations}");
+        assert!(!lines[0].contains("--only-needed"));
+        for line in &lines[1..] {
+            assert!(line.starts_with("--only-needed -o "), "{line}");
+            assert!(line.contains(archive_a.to_str().unwrap()), "{line}");
+            assert!(line.contains(archive_b.to_str().unwrap()), "{line}");
+        }
+        assert!(output.exists());
+        assert!(!PathBuf::from(format!("{}.direct-input", output.display())).exists());
+        assert!(!PathBuf::from(format!("{}.static-archive-current", output.display())).exists());
+        assert!(!PathBuf::from(format!("{}.static-archive-next", output.display())).exists());
+        let _ = fs::remove_dir_all(dir);
     }
 }
 
@@ -241,10 +552,16 @@ fn resolve_link_library(lib: &str, library_dirs: &[String], clang_path: &Path) -
     None
 }
 
+fn shared_library_soname(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Elf::parse(&bytes).ok()?.soname.map(ToOwned::to_owned)
+}
+
 fn exact_link_arg_for_library_path(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| format!("-l:{}", name))
+    path.file_name().and_then(|name| name.to_str()).map(|name| {
+        let name = shared_library_soname(path).unwrap_or_else(|| name.to_string());
+        format!("-l:{}", name)
+    })
 }
 
 fn push_array_arg(script: &mut String, arg: &str) {
@@ -283,31 +600,31 @@ fn linker_script_members(path: &Path) -> Option<Vec<String>> {
     }
 }
 
-fn push_library_path_link_args(
-    script: &mut String,
+fn library_path_link_args(
     lib_file: &Path,
     library_dirs: &[String],
     clang_path: &Path,
     visited: &mut Vec<PathBuf>,
-) -> bool {
+) -> Option<Vec<String>> {
     let canonical_path = canonical_or_absolute_path(lib_file);
 
     if visited.contains(&canonical_path) {
-        return true;
+        return Some(Vec::new());
     }
 
     if let Some(members) = linker_script_members(&canonical_path) {
         visited.push(canonical_path.clone());
         let script_dir = canonical_path.parent().unwrap_or(Path::new("."));
-        let mut expanded_any = false;
+        let mut expanded = Vec::new();
 
         for member in members {
             if let Some(lib) = member.strip_prefix("-l") {
-                if push_resolved_library_link_args(script, lib, library_dirs, clang_path, visited) {
-                    expanded_any = true;
+                if let Some(args) =
+                    resolved_library_link_args(lib, library_dirs, clang_path, visited)
+                {
+                    expanded.extend(args);
                 } else {
-                    push_array_arg(script, &member);
-                    expanded_any = true;
+                    expanded.push(member);
                 }
                 continue;
             }
@@ -320,42 +637,31 @@ fn push_library_path_link_args(
             };
 
             if candidate.exists() {
-                expanded_any |= push_library_path_link_args(
-                    script,
+                expanded.extend(library_path_link_args(
                     &candidate,
                     library_dirs,
                     clang_path,
                     visited,
-                );
+                )?);
             } else {
-                push_array_arg(script, &member);
-                expanded_any = true;
+                expanded.push(member);
             }
         }
 
-        return expanded_any;
+        return Some(expanded);
     }
 
-    let Some(exact_arg) = exact_link_arg_for_library_path(&canonical_path) else {
-        return false;
-    };
-
-    push_array_arg(script, &exact_arg);
-    true
+    exact_link_arg_for_library_path(&canonical_path).map(|arg| vec![arg])
 }
 
-fn push_resolved_library_link_args(
-    script: &mut String,
+fn resolved_library_link_args(
     lib: &str,
     library_dirs: &[String],
     clang_path: &Path,
     visited: &mut Vec<PathBuf>,
-) -> bool {
-    let Some(path) = resolve_link_library(lib, library_dirs, clang_path) else {
-        return false;
-    };
-
-    push_library_path_link_args(script, &path, library_dirs, clang_path, visited)
+) -> Option<Vec<String>> {
+    resolve_link_library(lib, library_dirs, clang_path)
+        .and_then(|path| library_path_link_args(&path, library_dirs, clang_path, visited))
 }
 
 fn is_rpath_arg(arg: &str) -> bool {
@@ -372,11 +678,286 @@ fn rpath_arg_consumes_next(arg: &str) -> bool {
     matches!(arg, "-rpath" | "--rpath" | "-Wl,-rpath" | "-Wl,--rpath")
 }
 
+fn is_rpath_link_arg(arg: &str) -> bool {
+    matches!(arg, "-rpath-link" | "--rpath-link")
+        || arg.starts_with("-rpath-link=")
+        || arg.starts_with("--rpath-link=")
+        || arg.starts_with("-Wl,-rpath-link,")
+        || arg.starts_with("-Wl,--rpath-link,")
+        || arg.starts_with("-Wl,-rpath-link=")
+        || arg.starts_with("-Wl,--rpath-link=")
+}
+
+fn compiler_only_option_consumes_next(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-D" | "-U"
+            | "-I"
+            | "-F"
+            | "-include"
+            | "-imacros"
+            | "-include-pch"
+            | "-idirafter"
+            | "-iprefix"
+            | "-iwithprefix"
+            | "-iwithprefixbefore"
+            | "-isystem"
+            | "-iquote"
+            | "-isysroot"
+            | "-resource-dir"
+            | "-Xclang"
+            | "-Xpreprocessor"
+    )
+}
+
+/// Options consumed by Clang's front end while compiling sources.  `_cmd`
+/// links already-produced bitcode, so retaining them is unnecessary and may
+/// disclose source/build-tree paths.
+fn is_compiler_only_option(arg: &str) -> bool {
+    matches!(arg, "-nostdinc" | "-nostdinc++" | "-fsyntax-only")
+        || arg.starts_with("-D")
+        || arg.starts_with("-U")
+        || (arg.starts_with("-I") && arg.len() > 2)
+        || (arg.starts_with("-F") && arg.len() > 2)
+        || arg.starts_with("-include=")
+        || arg.starts_with("-imacros=")
+        || arg.starts_with("-include-pch=")
+        || arg.starts_with("-idirafter=")
+        || arg.starts_with("-iprefix=")
+        || arg.starts_with("-iwithprefix=")
+        || arg.starts_with("-iwithprefixbefore=")
+        || arg.starts_with("-isystem=")
+        || arg.starts_with("-iquote=")
+        || arg.starts_with("-isysroot=")
+        || (arg.starts_with("-isysroot") && arg.len() > "-isysroot".len())
+        || arg.starts_with("-resource-dir=")
+        || arg.starts_with("-fdebug-prefix-map=")
+        || arg.starts_with("-ffile-prefix-map=")
+        || arg.starts_with("-fmacro-prefix-map=")
+}
+
+/// Return whether an argument is a linker option whose value makes a generated
+/// `_cmd` dependent on the original build root.  These options cannot be made
+/// relocatable merely by changing their spelling: a sysroot selects an entire
+/// toolchain and a general linker script can itself contain arbitrary paths.
+/// Build-time-only `rpath-link` options are removed before this validation.
+fn has_nonportable_linker_path_option(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+
+        // An rpath is deliberately removed from generated `_cmd` files unless
+        // it uses $ORIGIN (see generate_link_cmd_file).  Therefore temporary
+        // build-directory rpaths, such as libtool relink rpaths, must not make
+        // the original link fail. Skip both the option and its value here.
+        if is_rpath_arg(arg) {
+            index += if rpath_arg_consumes_next(arg) { 2 } else { 1 };
+            continue;
+        }
+        if is_rpath_link_arg(arg) {
+            index += if matches!(arg.as_str(), "-rpath-link" | "--rpath-link") {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+
+        let direct_option = matches!(arg.as_str(), "--sysroot" | "-T" | "--script")
+            || arg.starts_with("--sysroot=")
+            || (arg.starts_with("-T") && arg.len() > 2)
+            || arg.starts_with("--script=");
+        if direct_option {
+            return true;
+        }
+
+        if let Some(payload) = arg.strip_prefix("-Wl,") {
+            // `-Wl,` accepts a comma-separated list.  An absolute linker
+            // input is just as build-root dependent as an explicit `-T`.
+            if payload.split(',').any(|value| value.starts_with('/')) {
+                return true;
+            }
+            if payload == "--sysroot"
+                || payload.starts_with("--sysroot=")
+                || payload == "-T"
+                || payload.starts_with("-T,")
+                || payload.starts_with("-T=")
+                || payload == "--script"
+                || payload.starts_with("--script,")
+                || payload.starts_with("--script=")
+            {
+                return true;
+            }
+        }
+
+        // Clang's -Xlinker consumes exactly one linker argument.  A following
+        // -Xlinker is commonly used to pass the value of a two-token option.
+        if arg == "-Xlinker" {
+            let Some(payload) = args.get(index + 1).map(String::as_str) else {
+                return true;
+            };
+            if matches!(payload, "-rpath-link" | "--rpath-link") {
+                index += if args.get(index + 2).is_some_and(|arg| arg == "-Xlinker") {
+                    4
+                } else {
+                    3
+                };
+                continue;
+            }
+            if payload.starts_with("-rpath-link=") || payload.starts_with("--rpath-link=") {
+                index += 2;
+                continue;
+            }
+            if payload.starts_with('/')
+                || matches!(payload, "--sysroot" | "-T" | "--script")
+                || payload.starts_with("--sysroot=")
+                || (payload.starts_with("-T") && payload.len() > 2)
+                || payload.starts_with("--script=")
+            {
+                return true;
+            }
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    false
+}
+
 fn is_optimization_level_arg(arg: &str) -> bool {
     matches!(arg, "-O" | "-Ofast" | "-Og" | "-Os" | "-Oz")
         || arg.strip_prefix("-O").is_some_and(|level| {
             !level.is_empty() && level.chars().all(|character| character.is_ascii_digit())
         })
+}
+
+fn add_missing_ir_file(files: &mut Vec<PathBuf>, path: PathBuf) {
+    if !files.contains(&path) {
+        files.push(path);
+    }
+}
+
+fn merge_missing_ir_file(files: &mut Vec<PathBuf>, sidecar_path: &Path) {
+    let content = match fs::read_to_string(sidecar_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "Warning: Failed to read LLVM IR missing-member file {}: {}",
+                sidecar_path.display(),
+                error
+            );
+            return;
+        }
+    };
+
+    for path in content.lines().filter(|path| !path.is_empty()) {
+        add_missing_ir_file(files, PathBuf::from(path));
+    }
+}
+
+fn write_missing_ir_file(output: &Path, files: &[PathBuf]) -> std::io::Result<()> {
+    let sidecar_path = PathBuf::from(format!("{}_missing", output.display()));
+    if files.is_empty() {
+        match fs::remove_file(sidecar_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    } else {
+        let mut content = String::new();
+        for file in files {
+            content.push_str(&file.display().to_string());
+            content.push('\n');
+        }
+        fs::write(&sidecar_path, content)
+    }
+}
+
+fn run_llvm_link(
+    llvm_link: &Path,
+    output: &Path,
+    inputs: &[PathBuf],
+    only_needed: bool,
+    log_file: &File,
+) -> std::io::Result<()> {
+    let mut command = Command::new(llvm_link);
+    if only_needed {
+        command.arg("--only-needed");
+    }
+    command.arg("-o").arg(output).args(inputs);
+
+    let mut command_parts = vec![llvm_link.display().to_string()];
+    if only_needed {
+        command_parts.push("--only-needed".to_string());
+    }
+    command_parts.push("-o".to_string());
+    command_parts.push(output.display().to_string());
+    command_parts.extend(inputs.iter().map(|input| input.display().to_string()));
+    writeln!(
+        &mut log_file.try_clone()?,
+        "Command: {}",
+        command_parts.join(" ")
+    )?;
+
+    command.stdout(Stdio::from(log_file.try_clone()?));
+    command.stderr(Stdio::from(log_file.try_clone()?));
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "llvm-link exited with status {}",
+            status
+        )))
+    }
+}
+
+/// Merge direct bitcode and LLVM static archives with ELF-like archive member
+/// selection. llvm-link only performs one left-to-right archive scan, so repeat
+/// it once per archive to resolve dependencies introduced by later archives.
+fn merge_llvm_ir(
+    llvm_link: &Path,
+    output: &Path,
+    direct_inputs: &[PathBuf],
+    static_archives: &[PathBuf],
+    log_file: &File,
+) -> std::io::Result<()> {
+    if static_archives.is_empty() {
+        return run_llvm_link(llvm_link, output, direct_inputs, false, log_file);
+    }
+
+    let seed = PathBuf::from(format!("{}.direct-input", output.display()));
+    let current = PathBuf::from(format!("{}.static-archive-current", output.display()));
+    let next = PathBuf::from(format!("{}.static-archive-next", output.display()));
+    let cleanup = || {
+        let _ = fs::remove_file(&seed);
+        let _ = fs::remove_file(&current);
+        let _ = fs::remove_file(&next);
+    };
+    cleanup();
+
+    let result = (|| {
+        // A link target normally has direct object/source input. If it does
+        // not, retain llvm-link's old behavior rather than manufacturing an
+        // empty seed that could change shared-library semantics.
+        if direct_inputs.is_empty() {
+            return run_llvm_link(llvm_link, output, static_archives, false, log_file);
+        }
+        run_llvm_link(llvm_link, &seed, direct_inputs, false, log_file)?;
+        fs::rename(&seed, &current)?;
+        for _ in 0..static_archives.len() {
+            let mut inputs = Vec::with_capacity(static_archives.len() + 1);
+            inputs.push(current.clone());
+            inputs.extend_from_slice(static_archives);
+            run_llvm_link(llvm_link, &next, &inputs, true, log_file)?;
+            fs::rename(&next, &current)?;
+        }
+        fs::rename(&current, output)?;
+        Ok(())
+    })();
+    cleanup();
+    result
 }
 
 /// Handle link command (generate executable or shared library)
@@ -393,9 +974,7 @@ fn handle_link_command(
     let mut library_files: Vec<PathBuf> = Vec::new();
     let mut output_file: Option<PathBuf> = None;
     let mut other_args: Vec<String> = Vec::new();
-    let mut link_flags: Vec<String> = Vec::new();
     let mut library_dirs: Vec<String> = Vec::new();
-    let mut libraries: Vec<String> = Vec::new();
     let mut is_shared = false;
     let mut version_script: Option<PathBuf> = None;
     let mut soversion: Option<String> = None;
@@ -414,31 +993,21 @@ fn handle_link_command(
             output_file = Some(PathBuf::from(&arg[2..]));
         } else if arg == "-shared" {
             is_shared = true;
-            link_flags.push(arg.clone());
         } else if arg == "-L" {
             if i + 1 < args.len() {
                 library_dirs.push(args[i + 1].clone());
-                link_flags.push(arg.clone());
-                link_flags.push(args[i + 1].clone());
                 i += 2;
                 continue;
             }
         } else if arg.starts_with("-L") && arg.len() > 2 {
             let dir = &arg[2..];
             library_dirs.push(dir.to_string());
-            link_flags.push(arg.clone());
         } else if arg == "-l" {
             if i + 1 < args.len() {
-                libraries.push(args[i + 1].clone());
-                link_flags.push(arg.clone());
-                link_flags.push(args[i + 1].clone());
                 i += 2;
                 continue;
             }
         } else if arg.starts_with("-l") && arg.len() > 2 {
-            let lib = &arg[2..];
-            libraries.push(lib.to_string());
-            link_flags.push(arg.clone());
         } else if arg.ends_with(".o") && !arg.starts_with('-') {
             object_files.push(PathBuf::from(arg));
         } else if !arg.starts_with('-') && SOURCE_EXTENSIONS.iter().any(|ext| arg.ends_with(ext)) {
@@ -473,8 +1042,6 @@ fn handle_link_command(
             } else {
                 arg.clone()
             };
-
-            link_flags.push(normalized_arg.clone());
             other_args.push(normalized_arg.clone());
 
             if let Some(path) = normalized_arg.strip_prefix("-Wl,--version-script=") {
@@ -519,9 +1086,10 @@ fn handle_link_command(
     }
 
     // Second pass: use llvm-link to merge LLVM IR files
-    let mut llvm_ir_files: Vec<PathBuf> = Vec::new();
+    let mut direct_llvm_ir_files: Vec<PathBuf> = Vec::new();
+    let mut static_llvm_archives: Vec<PathBuf> = Vec::new();
     let mut temp_llvm_ir_files: Vec<PathBuf> = Vec::new();
-    let mut merged_static_lib_paths: Vec<PathBuf> = Vec::new();
+    let mut missing_ir_files: Vec<PathBuf> = Vec::new();
 
     // 1. Find LLVM IR files corresponding to .o files
     for obj_file in &object_files {
@@ -532,8 +1100,9 @@ fn handle_link_command(
         ir_path.push(rel_path);
 
         if ir_path.exists() {
-            llvm_ir_files.push(ir_path);
+            direct_llvm_ir_files.push(ir_path);
         } else {
+            add_missing_ir_file(&mut missing_ir_files, abs_obj);
             debug_log(
                 debug_mode,
                 &format!(
@@ -559,8 +1128,9 @@ fn handle_link_command(
                     ir_path.display()
                 ),
             );
-            llvm_ir_files.push(ir_path);
-            merged_static_lib_paths.push(lib_file.clone());
+            let sidecar_path = PathBuf::from(format!("{}_missing", ir_path.display()));
+            static_llvm_archives.push(ir_path);
+            merge_missing_ir_file(&mut missing_ir_files, &sidecar_path);
         } else {
             debug_log(
                 debug_mode,
@@ -617,7 +1187,7 @@ fn handle_link_command(
 
         match llvm_gen_result {
             Ok(status) if status.success() => {
-                llvm_ir_files.push(tmp_ir_path.clone());
+                direct_llvm_ir_files.push(tmp_ir_path.clone());
                 temp_llvm_ir_files.push(tmp_ir_path);
             }
             Ok(status) => {
@@ -639,7 +1209,7 @@ fn handle_link_command(
         }
     }
 
-    if llvm_ir_files.is_empty() {
+    if direct_llvm_ir_files.is_empty() && static_llvm_archives.is_empty() {
         debug_log(
             debug_mode,
             "[DEBUG] No LLVM IR files found, skipping llvm-link",
@@ -664,33 +1234,13 @@ fn handle_link_command(
         .unwrap_or("clang");
     let llvm_link_path = find_llvm_tool("llvm-link", clang_cmd_name);
 
-    let mut llvm_link_cmd = Command::new(&llvm_link_path);
-    llvm_link_cmd.arg("-o").arg(&llvm_link_output);
-
-    for ir_file in &llvm_ir_files {
-        llvm_link_cmd.arg(ir_file);
-    }
-
-    {
-        let mut cmd_parts = vec![llvm_link_path.display().to_string()];
-        cmd_parts.push("-o".to_string());
-        cmd_parts.push(llvm_link_output.display().to_string());
-        for ir_file in &llvm_ir_files {
-            cmd_parts.push(ir_file.display().to_string());
-        }
-        debug_log(
-            debug_mode,
-            &format!("[DEBUG] llvm-link: {}", cmd_parts.join(" ")),
-        );
-    }
-
     let log_path = format!("{}_log", llvm_link_output.display());
     if let Err(e) = ensure_dir_exists(&PathBuf::from(&log_path)) {
         eprintln!("Failed to create log file directory: {}", e);
         exit(1);
     }
 
-    let mut log_file = match File::create(&log_path) {
+    let log_file = match File::create(&log_path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Failed to create log file {}: {}", log_path, e);
@@ -698,23 +1248,35 @@ fn handle_link_command(
         }
     };
 
-    let mut cmd_parts: Vec<String> = vec![llvm_link_path.display().to_string()];
-    cmd_parts.push("-o".to_string());
-    cmd_parts.push(llvm_link_output.display().to_string());
-    for ir_file in &llvm_ir_files {
-        cmd_parts.push(ir_file.display().to_string());
-    }
+    debug_log(
+        debug_mode,
+        &format!(
+            "[DEBUG] LLVM IR merge: {} direct input(s), {} static archive(s)",
+            direct_llvm_ir_files.len(),
+            static_llvm_archives.len()
+        ),
+    );
+    match merge_llvm_ir(
+        &llvm_link_path,
+        &llvm_link_output,
+        &direct_llvm_ir_files,
+        &static_llvm_archives,
+        &log_file,
+    ) {
+        Ok(()) => {
+            if let Err(error) = write_missing_ir_file(&llvm_link_output, &missing_ir_files) {
+                eprintln!(
+                    "Failed to write LLVM IR missing-member file for {}: {}",
+                    llvm_link_output.display(),
+                    error
+                );
+                let _ = fs::remove_file(&llvm_link_output);
+                if output_path.exists() {
+                    let _ = fs::remove_file(&output_path);
+                }
+                exit(1);
+            }
 
-    let cmd_str = cmd_parts.join(" ");
-    let _ = writeln!(log_file, "Command: {}", cmd_str);
-
-    llvm_link_cmd.stdout(Stdio::from(log_file.try_clone().unwrap()));
-    llvm_link_cmd.stderr(Stdio::from(log_file));
-
-    let llvm_link_result = llvm_link_cmd.status();
-
-    match llvm_link_result {
-        Ok(status) if status.success() => {
             for ir_file in &temp_llvm_ir_files {
                 if let Err(e) = fs::remove_file(ir_file) {
                     eprintln!(
@@ -765,34 +1327,33 @@ fn handle_link_command(
                 clang_path,
                 &llvm_link_output,
                 &output_path,
-                &link_flags,
+                &args[1..],
                 &library_dirs,
-                &libraries,
-                &library_files,
-                &merged_static_lib_paths,
                 is_shared,
-                llvm_ir_dir,
-                &other_args,
                 version_script_dest.as_deref(),
                 soversion.as_deref(),
+                &missing_ir_files,
             ) {
-                eprintln!("Warning: Failed to generate _cmd file: {}", e);
+                eprintln!("Failed to generate _cmd file: {}", e);
+                let _ = fs::remove_file(&llvm_link_output);
+                let _ = fs::remove_file(format!("{}_missing", llvm_link_output.display()));
+                if output_path.exists() {
+                    let _ = fs::remove_file(&output_path);
+                }
+                exit(1);
             }
 
             exit(0);
         }
-        Ok(status) => {
+        Err(error) => {
             eprintln!("llvm-link failed, see {} for details", log_path);
             if output_path.exists() {
                 let _ = fs::remove_file(&output_path);
             }
-            exit(status.code().unwrap_or(1));
-        }
-        Err(e) => {
-            eprintln!("Failed to execute llvm-link: {}", e);
-            if output_path.exists() {
-                let _ = fs::remove_file(&output_path);
-            }
+            debug_log(
+                debug_mode,
+                &format!("[DEBUG] LLVM IR merge failed: {error}"),
+            );
             exit(1);
         }
     }
@@ -804,16 +1365,12 @@ fn generate_link_cmd_file(
     clang_path: &Path,
     llvm_link_output: &Path,
     original_output: &Path,
-    link_flags: &[String],
+    original_args: &[String],
     library_dirs: &[String],
-    libraries: &[String],
-    library_files: &[PathBuf],
-    merged_static_libs: &[PathBuf],
     is_shared: bool,
-    _llvm_ir_dir: &str,
-    other_args: &[String],
     version_script_dest: Option<&Path>,
     soversion: Option<&str>,
+    missing_ir_files: &[PathBuf],
 ) -> Result<(), std::io::Error> {
     let cmd_path = format!("{}_cmd", llvm_link_output.display());
 
@@ -866,6 +1423,17 @@ fn generate_link_cmd_file(
     script.push('\n');
     script.push_str("set -e\n\n");
 
+    // A non-relocatable linker path means no valid distributable `_cmd` can be
+    // produced. Fail the current link instead of emitting an intentionally
+    // broken command that would let the original build/install succeed.
+    if has_nonportable_linker_path_option(original_args) {
+        let _ = fs::remove_file(&cmd_path);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported non-relocatable linker path option (sysroot or linker script)",
+        ));
+    }
+
     script.push_str("# Create output directory\n");
     script.push_str("mkdir -p output\n\n");
 
@@ -873,198 +1441,217 @@ fn generate_link_cmd_file(
     script.push_str("cmd=(\n");
     push_array_arg(&mut script, &cmd_clang_path.display().to_string());
 
-    if is_shared {
-        push_array_arg(&mut script, "-shared");
-        push_array_arg(&mut script, "-fPIC");
-    }
-
     push_array_arg(&mut script, "-x");
     push_array_arg(&mut script, "ir");
     push_array_arg(&mut script, "-fuse-ld=lld");
+    // Installed executable commands live in lib/llvmir-bin, while shared
+    // libraries from the same package live in the parent lib directory.
+    // Preserve this package-local lookup path after normalizing libraries to
+    // -l:SONAME arguments.
+    push_array_arg(&mut script, "-L..");
 
-    let has_optimization_level = other_args
+    let has_optimization_level = original_args
         .iter()
-        .chain(link_flags)
         .any(|arg| is_optimization_level_arg(arg));
     if !has_optimization_level {
         push_array_arg(&mut script, "-O3");
     }
 
-    let mut skip_next = false;
-    for arg in other_args {
-        if skip_next {
-            skip_next = false;
+    let mut emitted_bitcode = false;
+    let mut visited_linker_scripts = Vec::new();
+    let mut index = 0;
+    while index < original_args.len() {
+        let arg = &original_args[index];
+        let next = original_args.get(index + 1);
+        if arg == "-o" {
+            index += 2;
             continue;
         }
-
-        if arg == "-c" || arg == "-emit-llvm" || arg == "-shared" || arg == "-ffat-lto-objects" {
+        if arg.starts_with("-o") && arg.len() > 2 {
+            index += 1;
+            continue;
+        }
+        if arg == "-c" || arg == "-emit-llvm" || arg == "-ffat-lto-objects" {
+            index += 1;
+            continue;
+        }
+        if compiler_only_option_consumes_next(arg) {
+            index += usize::from(next.is_some()) + 1;
+            continue;
+        }
+        if is_compiler_only_option(arg) {
+            index += 1;
+            continue;
+        }
+        if arg == "-L" {
+            if next.is_some() {
+                index += 2;
+                continue;
+            }
+        }
+        if arg.starts_with("-L") && arg.len() > 2 {
+            // Libraries are converted to exact -l:SONAME references below.
+            // Retaining an original search directory would leak the build
+            // layout into the generated, installable command.
+            index += 1;
+            continue;
+        }
+        if arg == "-Xlinker" {
+            let Some(payload) = next.map(String::as_str) else {
+                index += 1;
+                continue;
+            };
+            if payload.starts_with("--dependency-file=")
+                || payload.starts_with("-rpath-link=")
+                || payload.starts_with("--rpath-link=")
+            {
+                index += 2;
+                continue;
+            }
+            if matches!(
+                payload,
+                "--dependency-file" | "-rpath-link" | "--rpath-link"
+            ) {
+                // The value of the two-token option may be forwarded through
+                // a second -Xlinker.
+                index += if original_args
+                    .get(index + 2)
+                    .is_some_and(|arg| arg == "-Xlinker")
+                {
+                    4
+                } else {
+                    3
+                };
+                continue;
+            }
+        }
+        if is_rpath_link_arg(arg) {
+            index += if matches!(arg.as_str(), "-rpath-link" | "--rpath-link") {
+                usize::from(next.is_some()) + 1
+            } else {
+                1
+            };
+            continue;
+        }
+        if arg.starts_with("-Wl,--dependency-file,") || arg.starts_with("-Wl,--dependency-file=") {
+            index += 1;
+            continue;
+        }
+        if arg == "-Wl,--dependency-file" {
+            index += 2;
+            continue;
+        }
+        if arg == "-l" {
+            if let Some(library) = next {
+                if let Some(rewritten) = resolved_library_link_args(
+                    library,
+                    library_dirs,
+                    clang_path,
+                    &mut visited_linker_scripts,
+                ) {
+                    for argument in rewritten {
+                        push_array_arg(&mut script, &argument);
+                    }
+                } else {
+                    push_array_arg(&mut script, "-l");
+                    push_array_arg(&mut script, library);
+                }
+                index += 2;
+                continue;
+            }
+        }
+        if let Some(library) = arg.strip_prefix("-l").filter(|library| !library.is_empty()) {
+            if let Some(rewritten) = resolved_library_link_args(
+                library,
+                library_dirs,
+                clang_path,
+                &mut visited_linker_scripts,
+            ) {
+                for argument in rewritten {
+                    push_array_arg(&mut script, &argument);
+                }
+            } else {
+                push_array_arg(&mut script, arg);
+            }
+            index += 1;
             continue;
         }
         if is_rpath_arg(arg) {
-            skip_next = rpath_arg_consumes_next(arg);
+            let value = if rpath_arg_consumes_next(arg) {
+                next.map(String::as_str)
+            } else {
+                Some(arg.as_str())
+            };
+            let is_portable = value.is_some_and(|value| value.contains("$ORIGIN"));
+            if is_portable {
+                push_array_arg(&mut script, arg);
+                if rpath_arg_consumes_next(arg) {
+                    push_array_arg(&mut script, next.expect("rpath value checked"));
+                    index += 2;
+                    continue;
+                }
+            } else if rpath_arg_consumes_next(arg) {
+                index += 2;
+                continue;
+            }
+            index += 1;
             continue;
         }
-        if arg.starts_with("-Wl,--version-script=") {
+        if arg.starts_with("-Wl,--version-script=") || arg.starts_with("-Wl,-version-script,") {
+            if let Some(path) = version_script_dest
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+            {
+                push_array_arg(&mut script, &format!("-Wl,--version-script=./{path}"));
+            }
+            index += 1;
             continue;
         }
-        if arg.starts_with("-Wl,") {
+        if arg == "-Wl,-version-script" || arg == "-Wl,--version-script" {
+            if let Some(path) = version_script_dest
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+            {
+                push_array_arg(&mut script, &format!("-Wl,--version-script=./{path}"));
+            }
+            // Libtool commonly passes the script path as a separate
+            // `-Wl,<path>` argument. It is replaced by the copied sidecar.
+            index += usize::from(next.is_some()) + 1;
             continue;
         }
-        if arg == "-I" {
-            skip_next = true;
+        let is_native_input = !arg.starts_with('-')
+            && (arg.ends_with(".o")
+                || SOURCE_EXTENSIONS
+                    .iter()
+                    .any(|extension| arg.ends_with(extension))
+                || arg.ends_with(".a"));
+        if is_native_input {
+            if !emitted_bitcode {
+                push_array_arg(&mut script, &format!("./{bc_filename}"));
+                for missing_path in missing_ir_files {
+                    push_array_arg(&mut script, &format!("-Wl,{}", missing_path.display()));
+                }
+                emitted_bitcode = true;
+            }
+            index += 1;
             continue;
         }
-        if arg.starts_with("-I") {
+        if !arg.starts_with('-') && (arg.ends_with(".so") || arg.contains(".so.")) {
+            if let Some(rewritten) = exact_link_arg_for_library_path(Path::new(arg)) {
+                push_array_arg(&mut script, &rewritten);
+            } else {
+                push_array_arg(&mut script, arg);
+            }
+            index += 1;
             continue;
         }
-        if arg == "-D" {
-            skip_next = true;
-            continue;
-        }
-        if arg.starts_with("-D") {
-            continue;
-        }
-        if arg == "-U" {
-            skip_next = true;
-            continue;
-        }
-        if arg.starts_with("-U") {
-            continue;
-        }
-        if arg == "-include" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-imacros" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-idirafter" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-iprefix" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-iwithprefix" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-iwithprefixbefore" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-isystem" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-iquote" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-isysroot" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-MT" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-MF" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-MQ" {
-            skip_next = true;
-            continue;
-        }
-        if arg == "-MD" || arg == "-MMD" {
-            continue;
-        }
-        if arg == "-std" {
-            skip_next = true;
-            continue;
-        }
-        if arg.starts_with("-std=") {
-            continue;
-        }
-
         push_array_arg(&mut script, arg);
+        index += 1;
     }
-
-    let mut skip_next_link_flag = false;
-    for flag in link_flags {
-        if skip_next_link_flag {
-            skip_next_link_flag = false;
-            continue;
-        }
-        if flag == "-shared" && is_shared {
-            continue;
-        }
-        if flag.starts_with("-L") || flag.starts_with("-l") {
-            continue;
-        }
-        if is_rpath_arg(flag) {
-            skip_next_link_flag = rpath_arg_consumes_next(flag);
-            continue;
-        }
-        if flag.starts_with("-Wl,--version-script=") {
-            continue;
-        }
-        push_array_arg(&mut script, flag);
-    }
-
-    for dir in library_dirs {
-        push_array_arg(&mut script, &format!("-L{}", dir));
-    }
-
-    push_array_arg(&mut script, "-L");
-    push_array_arg(&mut script, "..");
-
-    push_array_arg(&mut script, &format!("./{}", bc_filename));
-
-    let mut visited_linker_scripts = Vec::new();
-
-    for lib_file in library_files {
-        if merged_static_libs.contains(lib_file) {
-            continue;
-        }
-
-        if push_library_path_link_args(
-            &mut script,
-            lib_file,
-            library_dirs,
-            clang_path,
-            &mut visited_linker_scripts,
-        ) {
-            continue;
-        }
-
-        push_array_arg(
-            &mut script,
-            &canonical_or_absolute_path(lib_file).display().to_string(),
-        );
-    }
-
-    for lib in libraries {
-        if !push_resolved_library_link_args(
-            &mut script,
-            lib,
-            library_dirs,
-            clang_path,
-            &mut visited_linker_scripts,
-        ) {
-            push_array_arg(&mut script, &format!("-l{}", lib));
-        }
-    }
-
-    if let Some(vs_path) = version_script_dest {
-        if let Some(vs_filename) = vs_path.file_name().and_then(|n| n.to_str()) {
-            push_array_arg(
-                &mut script,
-                &format!("-Wl,--version-script=./{}", vs_filename),
-            );
+    if !emitted_bitcode {
+        push_array_arg(&mut script, &format!("./{bc_filename}"));
+        for missing_path in missing_ir_files {
+            push_array_arg(&mut script, &format!("-Wl,{}", missing_path.display()));
         }
     }
 
@@ -1115,7 +1702,13 @@ fn main() {
 
     let debug_mode = is_debug_mode();
 
-    let args = expand_at_file_args(&original_args, debug_mode);
+    let args = match expand_at_file_args(&original_args, debug_mode) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("Failed to expand response file: {error}");
+            exit(1);
+        }
+    };
 
     let emit_llvmir_opt = get_emit_llvmir_opt();
 
@@ -1189,7 +1782,7 @@ fn main() {
     }
 
     // Parse compilation arguments
-    let mut input_file: Option<PathBuf> = None;
+    let mut input_files: Vec<PathBuf> = Vec::new();
     let mut output_file: Option<PathBuf> = None;
     let mut other_args: Vec<String> = Vec::new();
     let mut i = 1;
@@ -1243,33 +1836,18 @@ fn main() {
                 i += 2;
                 continue;
             }
-        } else if !arg.starts_with('-') && input_file.is_none() {
-            if Path::new(arg).exists() {
-                input_file = Some(PathBuf::from(arg));
-            } else {
-                other_args.push(arg.clone());
-            }
+        } else if !arg.starts_with('-')
+            && SOURCE_EXTENSIONS
+                .iter()
+                .any(|extension| arg.ends_with(extension))
+        {
+            input_files.push(PathBuf::from(arg));
         } else {
             other_args.push(arg.clone());
         }
 
         i += 1;
     }
-
-    let output_path = match &output_file {
-        Some(path) => path.clone(),
-        None => {
-            if let Some(ref input) = input_file {
-                let stem = input
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("output");
-                PathBuf::from(format!("{}.o", stem))
-            } else {
-                PathBuf::from("output.o")
-            }
-        }
-    };
 
     // First pass: normal compilation
     let mut normal_cmd = Command::new(&clang_path);
@@ -1310,161 +1888,97 @@ fn main() {
         Vec::new()
     };
 
-    let mut llvm_cmd = Command::new(&clang_path);
-    llvm_cmd.args(&other_args);
-
-    for opt in &extra_opts {
-        llvm_cmd.arg(opt);
-    }
-
-    llvm_cmd.arg("-emit-llvm");
-
-    if let Some(ref input) = input_file {
-        llvm_cmd.arg(input);
-    }
-
-    let abs_output = get_absolute_path(&output_path);
-
-    let mut ir_path = PathBuf::from(&llvm_ir_dir);
-    let rel_output = abs_output.strip_prefix("/").unwrap_or(&abs_output);
-    ir_path.push(rel_output);
-
-    let llvm_ir_path = ir_path;
-
-    if let Err(e) = ensure_dir_exists(&llvm_ir_path) {
-        debug_log(
-            debug_mode,
-            &format!(
-                "[DEBUG] Warning: Failed to create LLVM IR output directory: {}",
-                e
-            ),
-        );
-        exit(0);
-    }
-
-    let has_explicit_output = output_file.is_some() || input_file.is_some();
-
-    let (ir_output_path, use_tmp_file) = if has_explicit_output {
-        (llvm_ir_path.clone(), false)
-    } else {
-        let tmp_suffix = generate_tmp_suffix();
-        (append_tmp_suffix(&llvm_ir_path, &tmp_suffix), true)
-    };
-
-    llvm_cmd.arg("-o").arg(&ir_output_path);
-
-    {
-        let mut cmd_args: Vec<String> = other_args.clone();
-        for opt in &extra_opts {
-            cmd_args.push(opt.clone());
+    for input_file in &input_files {
+        let output_path = output_file.clone().unwrap_or_else(|| {
+            let mut output = input_file.clone();
+            output.set_extension("o");
+            output
+        });
+        let abs_output = get_absolute_path(&output_path);
+        let llvm_ir_path =
+            PathBuf::from(&llvm_ir_dir).join(abs_output.strip_prefix("/").unwrap_or(&abs_output));
+        if let Err(error) = ensure_dir_exists(&llvm_ir_path) {
+            debug_log(
+                debug_mode,
+                &format!("[DEBUG] Failed to create LLVM IR output directory: {error}"),
+            );
+            exit(0);
         }
-        cmd_args.push("-emit-llvm".to_string());
-        if let Some(ref input) = input_file {
-            cmd_args.push(input.display().to_string());
+
+        let mut llvm_cmd = Command::new(&clang_path);
+        llvm_cmd.args(&other_args);
+        llvm_cmd.args(&extra_opts);
+        llvm_cmd
+            .arg("-emit-llvm")
+            .arg(input_file)
+            .arg("-o")
+            .arg(&llvm_ir_path);
+
+        let log_path = format!("{}_log", llvm_ir_path.display());
+        if let Err(error) = ensure_dir_exists(&PathBuf::from(&log_path)) {
+            debug_log(
+                debug_mode,
+                &format!("[DEBUG] Failed to create LLVM IR log directory: {error}"),
+            );
+            exit(0);
         }
-        cmd_args.push("-o".to_string());
-        cmd_args.push(ir_output_path.display().to_string());
+        let mut log_file = match File::create(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                debug_log(
+                    debug_mode,
+                    &format!("[DEBUG] Failed to create LLVM IR log {log_path}: {error}"),
+                );
+                exit(0);
+            }
+        };
+        let mut cmd_parts = other_args.clone();
+        cmd_parts.extend(extra_opts.clone());
+        cmd_parts.extend([
+            "-emit-llvm".to_string(),
+            input_file.display().to_string(),
+            "-o".to_string(),
+            llvm_ir_path.display().to_string(),
+        ]);
         debug_log(
             debug_mode,
             &format!(
                 "[DEBUG] LLVM IR generation: {} {}",
                 clang_path.display(),
-                cmd_args.join(" ")
+                cmd_parts.join(" ")
             ),
         );
-    }
-
-    let log_path = format!("{}_log", llvm_ir_path.display());
-
-    if let Err(e) = ensure_dir_exists(&PathBuf::from(&log_path)) {
-        debug_log(
-            debug_mode,
-            &format!(
-                "[DEBUG] Warning: Failed to create log file directory: {}",
-                e
-            ),
+        let _ = writeln!(
+            log_file,
+            "Command: {} {}",
+            clang_path.display(),
+            cmd_parts.join(" ")
         );
-        exit(0);
-    }
+        llvm_cmd.stdout(Stdio::from(log_file.try_clone().unwrap()));
+        llvm_cmd.stderr(Stdio::from(log_file));
 
-    let mut log_file = match File::create(&log_path) {
-        Ok(f) => f,
-        Err(e) => {
-            debug_log(
-                debug_mode,
-                &format!(
-                    "[DEBUG] Warning: Failed to create log file {}: {}",
-                    log_path, e
-                ),
-            );
-            exit(0);
-        }
-    };
-
-    let mut cmd_parts: Vec<String> = vec![clang_path.display().to_string()];
-    cmd_parts.extend(other_args.clone());
-    for opt in &extra_opts {
-        cmd_parts.push(opt.clone());
-    }
-    cmd_parts.push("-emit-llvm".to_string());
-    if let Some(ref input) = input_file {
-        cmd_parts.push(input.display().to_string());
-    }
-    cmd_parts.push("-o".to_string());
-    cmd_parts.push(ir_output_path.display().to_string());
-
-    let cmd_str = cmd_parts.join(" ");
-    let _ = writeln!(log_file, "Command: {}", cmd_str);
-
-    llvm_cmd.stdout(Stdio::from(log_file.try_clone().unwrap()));
-    llvm_cmd.stderr(Stdio::from(log_file));
-
-    let llvm_result = llvm_cmd.status();
-
-    match llvm_result {
-        Ok(status) if status.success() => {
-            if use_tmp_file {
-                if let Err(_e) = fs::rename(&ir_output_path, &llvm_ir_path) {
-                    if let Err(copy_err) = fs::copy(&ir_output_path, &llvm_ir_path) {
-                        eprintln!(
-                            "Warning: Failed to move temp LLVM IR file: {} -> {}: copy error: {}",
-                            ir_output_path.display(),
-                            llvm_ir_path.display(),
-                            copy_err
-                        );
-                        let _ = fs::remove_file(&ir_output_path);
-                        exit(0);
-                    }
-                    let _ = fs::remove_file(&ir_output_path);
+        match llvm_cmd.status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                let _ = fs::remove_file(&llvm_ir_path);
+                if output_path.exists() {
+                    let _ = fs::remove_file(&output_path);
                 }
-            }
-            exit(0);
-        }
-        Ok(status) => {
-            debug_log(
-                debug_mode,
-                &format!(
-                    "[DEBUG] LLVM IR generation failed, see {} for details",
+                eprintln!(
+                    "LLVM IR generation failed for {}, see {} for details",
+                    input_file.display(),
                     log_path
-                ),
-            );
-            let _ = fs::remove_file(&ir_output_path);
-            // Remove the normal .o file as well since LLVM IR generation failed
-            if output_path.exists() {
-                let _ = fs::remove_file(&output_path);
+                );
+                exit(status.code().unwrap_or(1));
             }
-            exit(status.code().unwrap_or(1));
-        }
-        Err(e) => {
-            debug_log(
-                debug_mode,
-                &format!(
-                    "[DEBUG] Warning: Failed to execute LLVM IR generation: {}",
-                    e
-                ),
-            );
-            let _ = fs::remove_file(&ir_output_path);
-            exit(0);
+            Err(error) => {
+                debug_log(
+                    debug_mode,
+                    &format!("[DEBUG] Failed to execute LLVM IR generation: {error}"),
+                );
+                let _ = fs::remove_file(&llvm_ir_path);
+                exit(0);
+            }
         }
     }
 }

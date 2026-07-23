@@ -1,0 +1,1 @@
+extern "C" int same_cpp(void) { return 2; }

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -68,6 +69,17 @@ fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(parent).expect("failed to create parent directory");
     }
     fs::write(path, content).expect("failed to write test file");
+}
+
+fn asm_name_for(path: &Path) -> String {
+    let hash = hex::encode(Sha256::digest(path.as_os_str().as_encoded_bytes()));
+    format!(
+        "{}-{}",
+        &hash[..12],
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 test path")
+    )
 }
 
 fn run_wrapper(binary: &str, cwd: &Path, llvmir_dir: &Path, args: &[&str]) {
@@ -153,6 +165,204 @@ fn install_executable_to_bin_syncs_ir_into_lib_llvmir_bin() {
 
     assert!(root.join("image/usr/lib/llvmir-bin/prog.bc").exists());
     assert!(!root.join("image/usr/bin/llvmir/prog.bc").exists());
+}
+
+#[test]
+fn install_sbin_program_without_execute_mode_syncs_ir_into_lib_llvmir_sbin() {
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let source = root.join("daemon");
+    let target = root.join("image/usr/sbin/daemon");
+
+    // Build systems can apply the executable mode after invoking install.
+    // Treat sbin as an executable location even while this input is mode 0644.
+    write_file(&source, "program");
+    write_file(
+        &llvmir_path(&llvmir_dir, &source).with_extension("bc"),
+        "bitcode",
+    );
+    fs::create_dir_all(target.parent().expect("target should have parent"))
+        .expect("failed to create target parent");
+
+    run_wrapper(
+        "install",
+        root,
+        &llvmir_dir,
+        &["daemon", "image/usr/sbin/daemon"],
+    );
+
+    assert!(root.join("image/usr/lib/llvmir-sbin/daemon.bc").exists());
+    assert!(!root.join("image/usr/sbin/llvmir/daemon.bc").exists());
+}
+
+#[test]
+fn install_libexec_program_without_execute_mode_syncs_ir_into_lib_llvmir_libexec() {
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let source = root.join("helper");
+    let target = root.join("image/usr/libexec/helper");
+
+    write_file(&source, "program");
+    write_file(
+        &llvmir_path(&llvmir_dir, &source).with_extension("bc"),
+        "bitcode",
+    );
+    fs::create_dir_all(target.parent().expect("target should have parent"))
+        .expect("failed to create target parent");
+
+    run_wrapper(
+        "install",
+        root,
+        &llvmir_dir,
+        &["helper", "image/usr/libexec/helper"],
+    );
+
+    assert!(root.join("image/usr/lib/llvmir-libexec/helper.bc").exists());
+    assert!(!root.join("image/usr/libexec/llvmir/helper.bc").exists());
+}
+
+#[test]
+fn multi_source_compile_generates_bitcode_for_each_object() {
+    if !command_exists("clang") {
+        eprintln!("skipping multi-source compile test: clang is unavailable");
+        return;
+    }
+
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    write_file(&root.join("first.c"), "int first(void) { return 1; }\n");
+    write_file(&root.join("second.c"), "int second(void) { return 2; }\n");
+
+    let status = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args(["-c", "first.c", "second.c"])
+        .status()
+        .expect("failed to compile multiple sources with clang wrapper");
+    assert!(status.success(), "clang wrapper failed with {status}");
+
+    for object in [root.join("first.o"), root.join("second.o")] {
+        assert!(
+            object.is_file(),
+            "normal compile did not create {}",
+            object.display()
+        );
+        assert!(
+            llvmir_path(&llvmir_dir, &object).is_file(),
+            "LLVM IR was not generated for {}",
+            object.display()
+        );
+    }
+}
+
+#[test]
+fn install_static_library_embeds_missing_native_members_in_ir_archive() {
+    if !command_exists("clang") || !command_exists("llvm-ar") {
+        eprintln!("skipping installed static archive test: clang or llvm-ar is unavailable");
+        return;
+    }
+
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    write_file(&root.join("part.c"), "int part(void) { return 1; }\n");
+    write_file(
+        &root.join("native.s"),
+        ".text\n.globl native\nnative:\n  ret\n",
+    );
+
+    let compile_ir = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args(["part.c", "-c", "-o", "part.o"])
+        .status()
+        .expect("failed to compile bitcode-backed object");
+    assert!(compile_ir.success());
+    let compile_native = Command::new("clang")
+        .current_dir(root)
+        .args(["native.s", "-c", "-o", "native.o"])
+        .status()
+        .expect("failed to compile native object");
+    assert!(compile_native.success());
+
+    let archive = Command::new(bin("ar"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args(["csrD", "libpart.a", "part.o", "native.o"])
+        .status()
+        .expect("failed to create static archive");
+    assert!(archive.success());
+
+    fs::create_dir_all(root.join("image/usr/lib")).expect("failed to create install directory");
+    run_wrapper(
+        "install",
+        root,
+        &llvmir_dir,
+        &["libpart.a", "image/usr/lib/libpart.a"],
+    );
+
+    let installed_ir = root.join("image/usr/lib/llvmir/libpart.a");
+    let members = Command::new("llvm-ar")
+        .args(["t", installed_ir.to_str().expect("UTF-8 test path")])
+        .output()
+        .expect("failed to list installed LLVM archive");
+    assert!(members.status.success());
+    let members = String::from_utf8_lossy(&members.stdout);
+    assert!(members.lines().any(|member| member == "part.o"));
+    assert!(members.lines().any(|member| member == "native.o"));
+    assert!(
+        !root.join("image/usr/lib/llvmir/libpart.a_missing").exists(),
+        "embedded native archive members should not retain a sidecar"
+    );
+}
+
+#[test]
+fn install_nonstatic_ir_relocates_missing_objects_to_asm_directory() {
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let source = root.join("libdemo.so");
+    let missing_object = root.join("build/native.o");
+    let source_ir = llvmir_path(&llvmir_dir, &source);
+    let source_cmd = PathBuf::from(format!("{}_cmd", source_ir.display()));
+
+    write_file(&source, "shared-library-placeholder");
+    write_file(&source_ir, "bitcode");
+    write_file(&missing_object, "native-object");
+    write_file(
+        &PathBuf::from(format!("{}_missing", source_ir.display())),
+        &format!("{}\n", missing_object.display()),
+    );
+    write_file(
+        &source_cmd,
+        &format!(
+            "#!/bin/bash\ncmd=(\n  clang\n  ./libdemo.so\n  -Wl,{}\n  --output=output/libdemo.so\n)\n\"${{cmd[@]}}\"\n",
+            missing_object.display()
+        ),
+    );
+    fs::create_dir_all(root.join("image/usr/lib")).expect("failed to create install directory");
+
+    run_wrapper(
+        "install",
+        root,
+        &llvmir_dir,
+        &["libdemo.so", "image/usr/lib/libdemo.so"],
+    );
+
+    let installed_dir = root.join("image/usr/lib/llvmir");
+    assert!(!installed_dir.join("libdemo.so_missing").exists());
+    let installed_cmd = fs::read_to_string(installed_dir.join("libdemo.so_cmd"))
+        .expect("failed to read installed command");
+    let asm_name = asm_name_for(&missing_object);
+    assert!(installed_cmd.contains(&format!("./asm/{asm_name}")));
+    assert!(!installed_cmd.contains(&missing_object.display().to_string()));
+    assert!(installed_dir.join("asm").join(asm_name).is_file());
 }
 
 #[test]
@@ -297,6 +507,108 @@ fn meson_install_uses_manifest_and_destdir_to_sync_llvmir_files() {
     assert!(cmd.contains("libdemo.so.1_verscript"));
     assert!(destdir.join("usr/lib/llvmir-bin/demo.bc").exists());
     assert!(!destdir.join("usr/include/llvmir/demo.h").exists());
+}
+
+#[test]
+fn meson_install_handles_missing_native_members_like_install_wrap() {
+    if !command_exists("clang") || !command_exists("llvm-ar") {
+        eprintln!("skipping Meson missing-member test: clang or llvm-ar is unavailable");
+        return;
+    }
+
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let destdir = root.join("image");
+
+    let archive = root.join("build/libmixed.a");
+    let archive_ir = llvmir_path(&llvmir_dir, &archive);
+    let bitcode_member = root.join("build/ir.o");
+    let native_member = root.join("build/native.o");
+    fs::create_dir_all(root.join("build")).expect("failed to create build directory");
+    fs::create_dir_all(
+        archive_ir
+            .parent()
+            .expect("LLVM archive fixture should have a parent directory"),
+    )
+    .expect("failed to create LLVM archive directory");
+    write_file(&root.join("ir.c"), "int ir_part(void) { return 1; }\n");
+    write_file(
+        &root.join("native.c"),
+        "int native_part(void) { return 2; }\n",
+    );
+    for (source, object) in [("ir.c", &bitcode_member), ("native.c", &native_member)] {
+        let status = Command::new("clang")
+            .current_dir(root)
+            .args([source, "-c", "-o"])
+            .arg(object)
+            .status()
+            .expect("failed to compile native test object");
+        assert!(status.success());
+    }
+    let archive_status = Command::new("llvm-ar")
+        .args(["rcsD"])
+        .arg(&archive_ir)
+        .arg(&bitcode_member)
+        .status()
+        .expect("failed to create LLVM archive fixture");
+    assert!(archive_status.success());
+    write_file(&archive, "native archive placeholder");
+    write_file(
+        &PathBuf::from(format!("{}_missing", archive_ir.display())),
+        &format!("{}\n", native_member.display()),
+    );
+
+    let library = root.join("build/libdemo.so");
+    let library_ir = llvmir_path(&llvmir_dir, &library);
+    let missing_object = root.join("build/link-native.o");
+    write_file(&library, "shared-library-placeholder");
+    write_file(&library_ir, "bitcode");
+    write_file(&missing_object, "native-object");
+    write_file(
+        &PathBuf::from(format!("{}_cmd", library_ir.display())),
+        "#!/bin/bash\ncmd=(\n  clang\n  ./libdemo.so\n  -Wl,/build/link-native.o\n  --output=output/libdemo.so\n)\n\"${cmd[@]}\"\n",
+    );
+    write_file(
+        &PathBuf::from(format!("{}_missing", library_ir.display())),
+        &format!("{}\n", missing_object.display()),
+    );
+
+    let manifest = root.join("intro-installed.json");
+    write_file(
+        &manifest,
+        &json!({
+            archive.to_string_lossy(): "/usr/lib/libmixed.a",
+            library.to_string_lossy(): "/usr/lib/libdemo.so",
+        })
+        .to_string(),
+    );
+    run_meson_install(root, &llvmir_dir, &manifest, &destdir);
+
+    let installed_archive = destdir.join("usr/lib/llvmir/libmixed.a");
+    let archive_members = Command::new("llvm-ar")
+        .args(["t"])
+        .arg(&installed_archive)
+        .output()
+        .expect("failed to list installed LLVM archive");
+    assert!(archive_members.status.success());
+    assert!(String::from_utf8_lossy(&archive_members.stdout)
+        .lines()
+        .any(|member| member == "native.o"));
+    assert!(!destdir.join("usr/lib/llvmir/libmixed.a_missing").exists());
+
+    let installed_dir = destdir.join("usr/lib/llvmir");
+    assert!(!installed_dir.join("libdemo.so_missing").exists());
+    assert!(fs::read_dir(installed_dir.join("asm"))
+        .expect("Meson-installed asm directory should exist")
+        .next()
+        .is_some());
+    let cmd = fs::read_to_string(installed_dir.join("libdemo.so_cmd"))
+        .expect("failed to read Meson-installed command");
+    let asm_name = asm_name_for(&missing_object);
+    assert!(cmd.contains(&format!("./asm/{asm_name}")));
+    assert!(installed_dir.join("asm").join(asm_name).is_file());
+    assert!(!cmd.contains(&missing_object.display().to_string()));
 }
 
 #[test]
@@ -457,11 +769,9 @@ fn generated_cmd_script_expands_dash_l_to_real_library_path() {
         .arg("-lwrapdep")
         .arg(&symlink_cblas_lib)
         .arg("-O1")
-        .arg("-Wl,-rpath,/tmp/drop-rpath-comma")
-        .arg("-Wl,-rpath=/tmp/drop-rpath-equals")
-        .arg("-Wl,--rpath,/tmp/drop-rpath-long")
-        .arg("-Wl,-rpath")
-        .arg("-Wl,/tmp/drop-rpath-split")
+        .arg("-Wl,--as-needed")
+        .arg("-Wl,--no-undefined")
+        .arg("-Wl,-rpath,$ORIGIN/../lib")
         .args(["-o", "usesdep"])
         .status()
         .expect("failed to execute clang wrapper");
@@ -469,8 +779,8 @@ fn generated_cmd_script_expands_dash_l_to_real_library_path() {
 
     let cmd_file = llvmir_path(&llvmir_dir, &root.join("usesdep_cmd"));
     let script = fs::read_to_string(&cmd_file).expect("failed to read generated _cmd script");
-    let exact_link_arg = "-l:libwrapdep.so.1.0.0";
-    let exact_cblas_link_arg = "-l:libgslcblas.so.0.0.0";
+    let exact_link_arg = "-l:libwrapdep.so.1";
+    let exact_cblas_link_arg = "-l:libgslcblas.so.0";
     let symlink_lib_path = symlink_lib.display().to_string();
     let symlink_cblas_lib_path = symlink_cblas_lib.display().to_string();
     let real_cblas_lib_dir = real_cblas_lib
@@ -533,25 +843,36 @@ fn generated_cmd_script_expands_dash_l_to_real_library_path() {
             .any(|line| line.trim() == symlink_cblas_lib_path),
         "generated _cmd should not record the explicit development symlink path"
     );
-    for rpath_fragment in [
-        "-rpath",
-        "--rpath",
-        "/tmp/drop-rpath-comma",
-        "/tmp/drop-rpath-equals",
-        "/tmp/drop-rpath-long",
-        "/tmp/drop-rpath-split",
+    let command_args: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let library_position = command_args
+        .iter()
+        .position(|argument| *argument == exact_link_arg)
+        .expect("generated _cmd should contain the resolved library");
+    assert!(library_position > 0);
+    assert!(
+        !script.contains(&lib_dir.display().to_string()),
+        "generated _cmd should not retain the original build-only -L directory"
+    );
+    for linker_option in [
+        "-Wl,--as-needed",
+        "-Wl,--no-undefined",
+        "-Wl,-rpath,$ORIGIN/../lib",
     ] {
         assert!(
-            !script.contains(rpath_fragment),
-            "generated _cmd should not contain rpath fragment {rpath_fragment}"
+            script.contains(linker_option),
+            "generated _cmd should preserve linker option {linker_option}"
         );
     }
 }
 
 #[test]
-fn link_executable_merges_explicit_static_library_ir() {
-    if !command_exists("clang") || !command_exists("llvm-link") {
-        eprintln!("skipping static library merge test: clang or llvm-link is unavailable");
+fn static_library_ir_is_llvm_archive_and_records_missing_members() {
+    if !command_exists("clang") || !command_exists("llvm-ar") {
+        eprintln!("skipping static library archive test: clang or llvm-ar is unavailable");
         return;
     }
 
@@ -561,8 +882,8 @@ fn link_executable_merges_explicit_static_library_ir() {
 
     write_file(&root.join("util.c"), "int util(void) { return 7; }\n");
     write_file(
-        &root.join("main.c"),
-        "int util(void); int main(void) { return util() == 7 ? 0 : 1; }\n",
+        &root.join("asm-only.s"),
+        ".text\n.globl asm_only\nasm_only:\n  ret\n",
     );
 
     let compile_util = Command::new(bin("clang"))
@@ -577,50 +898,159 @@ fn link_executable_merges_explicit_static_library_ir() {
         "clang wrapper util compile failed with {compile_util}"
     );
 
+    let compile_asm = Command::new("clang")
+        .current_dir(root)
+        .args(["asm-only.s", "-c", "-o", "asm-only.o"])
+        .status()
+        .expect("failed to compile asm-only.o");
+    assert!(
+        compile_asm.success(),
+        "assembly compile failed with {compile_asm}"
+    );
+
     let archive = Command::new(bin("ar"))
         .current_dir(root)
         .env("EMIT_LLVMIR", "1")
         .env("LLVM_IR_DIR", &llvmir_dir)
-        .args(["csrDT", "libutil.a", "util.o"])
+        .args(["csrD", "libutil.a", "util.o", "asm-only.o"])
         .status()
         .expect("failed to archive libutil.a with ar wrapper");
     assert!(archive.success(), "ar wrapper failed with {archive}");
 
-    let compile_main = Command::new(bin("clang"))
+    let archive_ir = llvmir_path(&llvmir_dir, &root.join("libutil.a"));
+    let missing_sidecar = PathBuf::from(format!("{}_missing", archive_ir.display()));
+    let archive_members = Command::new("llvm-ar")
+        .arg("t")
+        .arg(&archive_ir)
+        .output()
+        .expect("failed to list LLVM archive members");
+    assert!(
+        archive_members.status.success(),
+        "llvm-ar failed to read generated archive: {}",
+        String::from_utf8_lossy(&archive_members.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&archive_members.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["util.o"],
+        "LLVM archive should contain only bitcode-backed members"
+    );
+    assert_eq!(
+        fs::read_to_string(&missing_sidecar).expect("failed to read missing-member sidecar"),
+        format!("{}\n", root.join("asm-only.o").display()),
+        "sidecar should contain the missing member's full absolute path"
+    );
+
+    let clean_archive_ir = llvmir_path(&llvmir_dir, &root.join("libclean.a"));
+    let clean_missing_sidecar = PathBuf::from(format!("{}_missing", clean_archive_ir.display()));
+    write_file(&clean_missing_sidecar, "/stale/member.o\n");
+
+    let archive_without_missing = Command::new(bin("ar"))
         .current_dir(root)
         .env("EMIT_LLVMIR", "1")
         .env("LLVM_IR_DIR", &llvmir_dir)
-        .args(["main.c", "-c", "-o", "main.o"])
+        .args(["csrD", "libclean.a", "util.o"])
         .status()
-        .expect("failed to compile main.o with clang wrapper");
+        .expect("failed to archive libclean.a with ar wrapper");
     assert!(
-        compile_main.success(),
-        "clang wrapper main compile failed with {compile_main}"
+        archive_without_missing.success(),
+        "ar wrapper failed with {archive_without_missing}"
+    );
+    assert!(
+        !clean_missing_sidecar.exists(),
+        "archive without missing members should not leave a sidecar"
+    );
+}
+
+#[test]
+fn final_link_missing_sidecar_merges_direct_and_static_library_entries() {
+    if !command_exists("clang") || !command_exists("llvm-link") || !command_exists("llvm-ar") {
+        eprintln!("skipping final missing-sidecar test: LLVM tools are unavailable");
+        return;
+    }
+
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+
+    write_file(&root.join("libpart.c"), "int libpart(void) { return 7; }\n");
+    write_file(
+        &root.join("main.c"),
+        "int libpart(void); int native_only(void); int main(void) { return libpart() + native_only() != 10; }\n",
+    );
+    write_file(
+        &root.join("native-only.c"),
+        "int native_only(void) { return 3; }\n",
+    );
+    write_file(&root.join("clean-main.c"), "int main(void) { return 0; }\n");
+    write_file(
+        &root.join("archive-missing.s"),
+        ".text\n.globl archive_missing\narchive_missing:\n  ret\n",
     );
 
-    let libutil = root.join("libutil.a");
+    let compile_libpart = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args(["libpart.c", "-c", "-o", "libpart.o"])
+        .status()
+        .expect("failed to compile libpart.o with clang wrapper");
+    assert!(compile_libpart.success());
+
+    for (source, object) in [
+        ("native-only.c", "native-only.o"),
+        ("archive-missing.s", "archive-missing.o"),
+    ] {
+        let status = Command::new("clang")
+            .current_dir(root)
+            .args([source, "-c", "-o", object])
+            .status()
+            .expect("failed to compile native test object");
+        assert!(status.success());
+    }
+
+    let archive = Command::new(bin("ar"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args(["csrD", "libpart.a", "libpart.o", "archive-missing.o"])
+        .status()
+        .expect("failed to create static library with ar wrapper");
+    assert!(archive.success());
+
     let link = Command::new(bin("clang"))
         .current_dir(root)
         .env("EMIT_LLVMIR", "1")
         .env("LLVM_IR_DIR", &llvmir_dir)
-        .arg("main.o")
-        .arg(&libutil)
-        .args(["-o", "app"])
+        .args(["main.c", "native-only.o", "libpart.a", "-o", "app"])
         .status()
         .expect("failed to link app with clang wrapper");
     assert!(link.success(), "clang wrapper link failed with {link}");
 
     let app_ir = llvmir_path(&llvmir_dir, &root.join("app"));
-    let app_log = PathBuf::from(format!("{}_log", app_ir.display()));
-    let archive_ir = llvmir_path(&llvmir_dir, &libutil);
-    let log = fs::read_to_string(&app_log).expect("failed to read app llvm-link log");
+    let app_missing = PathBuf::from(format!("{}_missing", app_ir.display()));
+    assert_eq!(
+        fs::read_to_string(&app_missing).expect("failed to read final missing sidecar"),
+        format!(
+            "{}\n{}\n",
+            root.join("native-only.o").display(),
+            root.join("archive-missing.o").display(),
+        ),
+        "final sidecar should contain direct and static-library missing members"
+    );
 
-    assert!(app_ir.exists());
-    assert!(archive_ir.exists());
+    let clean_link = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args(["clean-main.c", "-o", "app"])
+        .status()
+        .expect("failed to relink app without missing direct objects");
+    assert!(clean_link.success());
     assert!(
-        log.contains(&archive_ir.display().to_string()),
-        "executable llvm-link log should include static library IR {}",
-        archive_ir.display()
+        !app_missing.exists(),
+        "relink without missing members should remove a stale final sidecar"
     );
 }
 
@@ -709,10 +1139,10 @@ fn generated_cmd_expands_linker_script_input_dependencies() {
 
     assert!(script
         .lines()
-        .any(|line| line.trim() == "-l:libprimary.so.1.0.0"));
+        .any(|line| line.trim() == "-l:libprimary.so.1"));
     assert!(script
         .lines()
-        .any(|line| line.trim() == "-l:libscriptdep.so.2.0.0"));
+        .any(|line| line.trim() == "-l:libscriptdep.so.2"));
     assert!(!script.lines().any(|line| line.trim() == "-lwrapscript"));
     assert!(!script.lines().any(|line| line.trim() == "-lscriptdep"));
 }

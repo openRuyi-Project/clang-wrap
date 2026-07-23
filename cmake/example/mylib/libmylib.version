@@ -1,0 +1,14 @@
+{
+  global:
+    mylib_add;
+    mylib_subtract;
+    mylib_multiply;
+    mylib_divide;
+    mylib_string_length;
+    mylib_string_compare;
+    mylib_factorial;
+    mylib_fibonacci;
+    mylib_print_version;
+  local:
+    *;
+};
