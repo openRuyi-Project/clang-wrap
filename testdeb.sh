@@ -309,7 +309,8 @@ test_pixman() {
 		meson compile -C . -j`nproc`
 		meson install -C . --destdir=`pwd`/install
 		meson-install meson-info/intro-installed.json `pwd`/install
-		run_llvmir_cmds install/usr/lib/llvmir
+		triplet=`dpkg-architecture -qDEB_HOST_MULTIARCH`
+		run_llvmir_cmds install/usr/lib/$triplet/llvmir
 		run_llvmir_cmds install/usr/lib/llvmir-bin
 	)
 }

@@ -449,7 +449,7 @@ fn install_shared_library_temp_t_uses_soname_for_installed_ir() {
 }
 
 #[test]
-fn meson_install_uses_manifest_and_destdir_to_sync_llvmir_files() {
+fn meson_install_preserves_multiarch_manifest_destination_for_llvmir() {
     let test_dir = TestDir::new();
     let root = test_dir.path();
     let llvmir_dir = root.join("llvmir");
@@ -484,17 +484,17 @@ fn meson_install_uses_manifest_and_destdir_to_sync_llvmir_files() {
     write_file(
         &manifest,
         &json!({
-            library.to_string_lossy(): "/usr/lib/libdemo.so.1.2.3",
+            library.to_string_lossy(): "/usr/lib/x86_64-linux-gnu/libdemo.so.1.2.3",
             executable.to_string_lossy(): "/usr/bin/demo",
             header.to_string_lossy(): "/usr/include/demo.h",
-            "libdemo.so.1": "/usr/lib/libdemo.so.1",
+            "libdemo.so.1": "/usr/lib/x86_64-linux-gnu/libdemo.so.1",
         })
         .to_string(),
     );
 
     run_meson_install(root, &llvmir_dir, &manifest, &destdir);
 
-    let llvmir_lib_dir = destdir.join("usr/lib/llvmir");
+    let llvmir_lib_dir = destdir.join("usr/lib/x86_64-linux-gnu/llvmir");
     assert!(llvmir_lib_dir.join("libdemo.so.1").exists());
     assert!(llvmir_lib_dir.join("libdemo.so.1_cmd").exists());
     assert!(llvmir_lib_dir.join("libdemo.so.1_verscript").exists());
@@ -506,6 +506,7 @@ fn meson_install_uses_manifest_and_destdir_to_sync_llvmir_files() {
     assert!(cmd.contains("./libdemo.so.1"));
     assert!(cmd.contains("libdemo.so.1_verscript"));
     assert!(destdir.join("usr/lib/llvmir-bin/demo.bc").exists());
+    assert!(!destdir.join("usr/lib/llvmir/libdemo.so.1").exists());
     assert!(!destdir.join("usr/include/llvmir/demo.h").exists());
 }
 

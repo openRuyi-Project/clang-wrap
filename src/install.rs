@@ -111,13 +111,10 @@ fn is_executable(path: &Path, mode: Option<&str>) -> bool {
 
 fn llvmir_install_dir(installed_path: &Path, shared: bool, executable: bool) -> PathBuf {
     let parent = installed_path.parent().unwrap_or(installed_path);
-    let parent_string = parent.to_string_lossy();
     if shared {
-        if let Some(index) = parent_string.find("/lib/") {
-            return PathBuf::from(format!("{}/llvmir", &parent_string[..index + 4]));
-        }
         return parent.join("llvmir");
     }
+    let parent_string = parent.to_string_lossy();
     if executable {
         let parent_name = parent.file_name().and_then(|name| name.to_str());
         if parent_name == Some("sbin") {
