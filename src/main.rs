@@ -403,6 +403,7 @@ mod tests {
             &output,
             std::slice::from_ref(&direct),
             &[archive_a.clone(), archive_b.clone()],
+            &[],
             &log_file,
         )
         .unwrap();
@@ -420,6 +421,102 @@ mod tests {
         assert!(!PathBuf::from(format!("{}.direct-input", output.display())).exists());
         assert!(!PathBuf::from(format!("{}.static-archive-current", output.display())).exists());
         assert!(!PathBuf::from(format!("{}.static-archive-next", output.display())).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn whole_archive_bitcode_is_merged_without_symbol_selection() {
+        let dir = unique_temp_dir("llvm-link-whole-archive");
+        let linker = dir.join("fake-llvm-link");
+        let invocation_log = dir.join("invocations");
+        let output = dir.join("merged.bc");
+        let direct = dir.join("version.bc");
+        let archive = dir.join("libconvenience.a");
+        let member = dir.join("convenience.bc");
+        let log_file = File::create(dir.join("merge.log")).unwrap();
+        fs::write(&direct, "direct").unwrap();
+        fs::write(&member, "archive").unwrap();
+        let status = Command::new(find_llvm_tool("llvm-ar", "clang"))
+            .args(["rcsD"])
+            .arg(&archive)
+            .arg(&member)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::write(
+            &linker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\nprintf merged > \"$out\"\n",
+                invocation_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&linker).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&linker, permissions).unwrap();
+
+        merge_llvm_ir(
+            &linker,
+            &output,
+            std::slice::from_ref(&direct),
+            &[],
+            std::slice::from_ref(&archive),
+            &log_file,
+        )
+        .unwrap();
+
+        let invocations = fs::read_to_string(&invocation_log).unwrap();
+        let lines = invocations.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{invocations}");
+        assert!(!lines[1].contains("--only-needed"), "{invocations}");
+        assert!(
+            lines[1].contains(archive.to_str().unwrap()),
+            "{invocations}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn whole_archive_option_is_detected_when_forwarded_to_the_linker() {
+        for args in [
+            vec!["-Wl,--whole-archive"],
+            vec!["-Wl,--as-needed,--whole-archive"],
+            vec!["-Xlinker", "--whole-archive"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(has_whole_archive_option(&args), "{args:?}");
+        }
+
+        assert!(!has_whole_archive_option(&[
+            "-Wl,--no-whole-archive".to_string()
+        ]));
+    }
+
+    #[test]
+    fn archives_embedded_in_wl_whole_archive_options_are_collected() {
+        let paths = whole_archives_in_wl_arg(
+            "-Wl,--as-needed,--whole-archive,/tmp/libone.a,relative/libtwo.a,--no-whole-archive",
+        );
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/tmp/libone.a"),
+                PathBuf::from("relative/libtwo.a")
+            ]
+        );
+        assert!(whole_archives_in_wl_arg("-Wl,--whole-archive,--no-whole-archive").is_empty());
+    }
+
+    #[test]
+    fn symlinked_object_uses_its_canonical_path_for_ir_lookup() {
+        let dir = unique_temp_dir("symlinked-ir-input");
+        let target = dir.join("source.o");
+        let link = dir.join(".libs/libfoo.lax/source.o");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        fs::write(&target, "native object").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(ir_lookup_paths(&link), vec![link.clone(), target]);
         let _ = fs::remove_dir_all(dir);
     }
 }
@@ -831,6 +928,55 @@ fn is_optimization_level_arg(arg: &str) -> bool {
         })
 }
 
+fn has_whole_archive_option(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        arg.strip_prefix("-Wl,")
+            .is_some_and(|options| options.split(',').any(|option| option == "--whole-archive"))
+            || (arg == "-Xlinker"
+                && args
+                    .get(index + 1)
+                    .is_some_and(|option| option == "--whole-archive"))
+    })
+}
+
+/// Extract archive paths embedded in one GCC `-Wl,` argument while GNU ld's
+/// `--whole-archive` mode is active.  Libtool commonly emits its convenience
+/// archives this way rather than as separate argv entries, e.g.
+/// `-Wl,--whole-archive,a.a,b.a,--no-whole-archive`.
+fn whole_archives_in_wl_arg(arg: &str) -> Vec<PathBuf> {
+    let Some(options) = arg.strip_prefix("-Wl,") else {
+        return Vec::new();
+    };
+
+    let mut whole_archive_active = false;
+    let mut archives = Vec::new();
+    for option in options.split(',') {
+        match option {
+            "--whole-archive" => whole_archive_active = true,
+            "--no-whole-archive" => whole_archive_active = false,
+            _ if whole_archive_active && option.ends_with(".a") => {
+                archives.push(PathBuf::from(option));
+            }
+            _ => {}
+        }
+    }
+    archives
+}
+
+/// Return the literal input path followed by its resolved target, if the
+/// input is a symlink. Libtool expands convenience archives into temporary
+/// `.lax` symlinks at final-link time, whereas their bitcode remains beside
+/// the original object.
+fn ir_lookup_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![path.to_path_buf()];
+    if let Ok(canonical) = path.canonicalize() {
+        if canonical != path {
+            paths.push(canonical);
+        }
+    }
+    paths
+}
+
 fn add_missing_ir_file(files: &mut Vec<PathBuf>, path: PathBuf) {
     if !files.contains(&path) {
         files.push(path);
@@ -913,6 +1059,83 @@ fn run_llvm_link(
     }
 }
 
+/// Copy whole archives that duplicate a direct input and remove only byte-for-
+/// byte identical members.  Libtool may put an object's IR in both the direct
+/// link inputs and a convenience archive (GSL's `version.o` does this).  GNU
+/// ld avoids the duplicate while expanding the archive; llvm-link reports a
+/// multiply-defined global if fed both copies.
+fn filtered_whole_archives(
+    llvm_ar: &Path,
+    output: &Path,
+    direct_inputs: &[PathBuf],
+    whole_archives: &[PathBuf],
+) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let direct_members: Vec<(String, Vec<u8>)> = direct_inputs
+        .iter()
+        .filter_map(|input| {
+            Some((
+                input.file_name()?.to_str()?.to_string(),
+                fs::read(input).ok()?,
+            ))
+        })
+        .collect();
+    let mut filtered = Vec::with_capacity(whole_archives.len());
+    let mut temporary_archives = Vec::new();
+
+    for (index, archive) in whole_archives.iter().enumerate() {
+        let members = Command::new(llvm_ar).arg("t").arg(archive).output()?;
+        if !members.status.success() {
+            return Err(std::io::Error::other(format!(
+                "{} failed to list {}",
+                llvm_ar.display(),
+                archive.display()
+            )));
+        }
+
+        let mut duplicates = Vec::new();
+        for member in String::from_utf8_lossy(&members.stdout).lines() {
+            for (direct_name, direct_bytes) in &direct_members {
+                if member != direct_name {
+                    continue;
+                }
+                let member_bytes = Command::new(llvm_ar)
+                    .arg("p")
+                    .arg(archive)
+                    .arg(member)
+                    .output()?;
+                if member_bytes.status.success() && member_bytes.stdout == *direct_bytes {
+                    duplicates.push(member.to_string());
+                }
+            }
+        }
+
+        if duplicates.is_empty() {
+            filtered.push(archive.clone());
+            continue;
+        }
+
+        let temporary = PathBuf::from(format!("{}.whole-archive-{index}", output.display()));
+        fs::copy(archive, &temporary)?;
+        let status = Command::new(llvm_ar)
+            .arg("d")
+            .arg(&temporary)
+            .args(&duplicates)
+            .status()?;
+        if !status.success() {
+            let _ = fs::remove_file(&temporary);
+            return Err(std::io::Error::other(format!(
+                "{} failed to remove duplicate members from {}",
+                llvm_ar.display(),
+                archive.display()
+            )));
+        }
+        filtered.push(temporary.clone());
+        temporary_archives.push(temporary);
+    }
+
+    Ok((filtered, temporary_archives))
+}
+
 /// Merge direct bitcode and LLVM static archives with ELF-like archive member
 /// selection. llvm-link only performs one left-to-right archive scan, so repeat
 /// it once per archive to resolve dependencies introduced by later archives.
@@ -921,19 +1144,32 @@ fn merge_llvm_ir(
     output: &Path,
     direct_inputs: &[PathBuf],
     static_archives: &[PathBuf],
+    whole_archives: &[PathBuf],
     log_file: &File,
 ) -> std::io::Result<()> {
-    if static_archives.is_empty() {
+    if static_archives.is_empty() && whole_archives.is_empty() {
         return run_llvm_link(llvm_link, output, direct_inputs, false, log_file);
     }
 
     let seed = PathBuf::from(format!("{}.direct-input", output.display()));
     let current = PathBuf::from(format!("{}.static-archive-current", output.display()));
     let next = PathBuf::from(format!("{}.static-archive-next", output.display()));
+    let llvm_ar = find_llvm_tool(
+        "llvm-ar",
+        llvm_link
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("llvm-link"),
+    );
+    let (whole_archives, temporary_archives) =
+        filtered_whole_archives(&llvm_ar, output, direct_inputs, whole_archives)?;
     let cleanup = || {
         let _ = fs::remove_file(&seed);
         let _ = fs::remove_file(&current);
         let _ = fs::remove_file(&next);
+        for archive in &temporary_archives {
+            let _ = fs::remove_file(archive);
+        }
     };
     cleanup();
 
@@ -942,7 +1178,9 @@ fn merge_llvm_ir(
         // not, retain llvm-link's old behavior rather than manufacturing an
         // empty seed that could change shared-library semantics.
         if direct_inputs.is_empty() {
-            return run_llvm_link(llvm_link, output, static_archives, false, log_file);
+            let mut inputs = static_archives.to_vec();
+            inputs.extend_from_slice(&whole_archives);
+            return run_llvm_link(llvm_link, output, &inputs, false, log_file);
         }
         run_llvm_link(llvm_link, &seed, direct_inputs, false, log_file)?;
         fs::rename(&seed, &current)?;
@@ -951,6 +1189,18 @@ fn merge_llvm_ir(
             inputs.push(current.clone());
             inputs.extend_from_slice(static_archives);
             run_llvm_link(llvm_link, &next, &inputs, true, log_file)?;
+            fs::rename(&next, &current)?;
+        }
+        // GNU ld's --whole-archive means every member is included regardless
+        // of unresolved references.  llvm-link's --only-needed intentionally
+        // has the opposite behaviour for archives, so merge these archives
+        // without it. This is essential for libtool convenience archives such
+        // as GSL's, whose public functions are not referenced by version.o.
+        if !whole_archives.is_empty() {
+            let mut inputs = Vec::with_capacity(whole_archives.len() + 1);
+            inputs.push(current.clone());
+            inputs.extend_from_slice(&whole_archives);
+            run_llvm_link(llvm_link, &next, &inputs, false, log_file)?;
             fs::rename(&next, &current)?;
         }
         fs::rename(&current, output)?;
@@ -972,12 +1222,14 @@ fn handle_link_command(
     let mut object_files: Vec<PathBuf> = Vec::new();
     let mut source_files: Vec<PathBuf> = Vec::new();
     let mut library_files: Vec<PathBuf> = Vec::new();
+    let mut whole_archive_files: Vec<PathBuf> = Vec::new();
     let mut output_file: Option<PathBuf> = None;
     let mut other_args: Vec<String> = Vec::new();
     let mut library_dirs: Vec<String> = Vec::new();
     let mut is_shared = false;
     let mut version_script: Option<PathBuf> = None;
     let mut soversion: Option<String> = None;
+    let mut whole_archive_active = false;
     let mut i = 1;
 
     while i < args.len() {
@@ -1015,7 +1267,12 @@ fn handle_link_command(
         } else if !arg.starts_with('-')
             && (arg.ends_with(".so") || arg.contains(".so.") || arg.ends_with(".a"))
         {
-            library_files.push(PathBuf::from(arg));
+            let library_file = PathBuf::from(arg);
+            if whole_archive_active && library_file.extension().is_some_and(|ext| ext == "a") {
+                whole_archive_files.push(library_file);
+            } else {
+                library_files.push(library_file);
+            }
         } else if arg.starts_with("-Wl,") || arg.starts_with("-framework") {
             let normalized_arg = if let Some(path) = arg.strip_prefix("-Wl,-version-script,") {
                 format!("-Wl,--version-script={}", path)
@@ -1043,6 +1300,18 @@ fn handle_link_command(
                 arg.clone()
             };
             other_args.push(normalized_arg.clone());
+
+            // `-Wl,` splits its comma-separated payload into individual ld
+            // argv entries. Libtool uses that facility to place convenience
+            // archives *inside* the whole-archive span, leaving no standalone
+            // `.a` token for the normal parser to see.
+            whole_archive_files.extend(whole_archives_in_wl_arg(&normalized_arg));
+
+            if normalized_arg == "-Wl,--whole-archive" {
+                whole_archive_active = true;
+            } else if normalized_arg == "-Wl,--no-whole-archive" {
+                whole_archive_active = false;
+            }
 
             if let Some(path) = normalized_arg.strip_prefix("-Wl,--version-script=") {
                 version_script = Some(PathBuf::from(path));
@@ -1088,26 +1357,29 @@ fn handle_link_command(
     // Second pass: use llvm-link to merge LLVM IR files
     let mut direct_llvm_ir_files: Vec<PathBuf> = Vec::new();
     let mut static_llvm_archives: Vec<PathBuf> = Vec::new();
+    let mut whole_llvm_archives: Vec<PathBuf> = Vec::new();
     let mut temp_llvm_ir_files: Vec<PathBuf> = Vec::new();
     let mut missing_ir_files: Vec<PathBuf> = Vec::new();
 
     // 1. Find LLVM IR files corresponding to .o files
     for obj_file in &object_files {
         let abs_obj = get_absolute_path(obj_file);
+        let ir_path = ir_lookup_paths(&abs_obj).into_iter().find_map(|candidate| {
+            let mut ir_path = PathBuf::from(llvm_ir_dir);
+            let rel_path = candidate.strip_prefix("/").unwrap_or(&candidate);
+            ir_path.push(rel_path);
+            ir_path.exists().then_some(ir_path)
+        });
 
-        let mut ir_path = PathBuf::from(llvm_ir_dir);
-        let rel_path = abs_obj.strip_prefix("/").unwrap_or(&abs_obj);
-        ir_path.push(rel_path);
-
-        if ir_path.exists() {
+        if let Some(ir_path) = ir_path {
             direct_llvm_ir_files.push(ir_path);
         } else {
-            add_missing_ir_file(&mut missing_ir_files, abs_obj);
+            add_missing_ir_file(&mut missing_ir_files, abs_obj.clone());
             debug_log(
                 debug_mode,
                 &format!(
                     "[DEBUG] Warning: LLVM IR file not found: {}",
-                    ir_path.display()
+                    abs_obj.display()
                 ),
             );
         }
@@ -1209,7 +1481,36 @@ fn handle_link_command(
         }
     }
 
-    if direct_llvm_ir_files.is_empty() && static_llvm_archives.is_empty() {
+    for lib_file in &whole_archive_files {
+        if let Some(ir_path) = find_llvmir_file(lib_file, llvm_ir_dir) {
+            let sidecar_path = PathBuf::from(format!("{}_missing", ir_path.display()));
+            merge_missing_ir_file(&mut missing_ir_files, &sidecar_path);
+            whole_llvm_archives.push(ir_path);
+        } else {
+            debug_log(
+                debug_mode,
+                &format!(
+                    "[DEBUG] Warning: LLVM IR file not found for whole static library: {}",
+                    lib_file.display()
+                ),
+            );
+        }
+    }
+
+    // Libtool's convenience archives are commonly passed via an argv shape
+    // that records `--whole-archive` separately from the archive paths.  If
+    // that shape was not associated with a concrete input above, preserving
+    // normal archive selection would silently discard public API members.
+    // Promote the collected archives as a conservative fallback; this keeps
+    // the shared-library IR equivalent to the native link.
+    if whole_llvm_archives.is_empty() && has_whole_archive_option(&args[1..]) {
+        whole_llvm_archives.append(&mut static_llvm_archives);
+    }
+
+    if direct_llvm_ir_files.is_empty()
+        && static_llvm_archives.is_empty()
+        && whole_llvm_archives.is_empty()
+    {
         debug_log(
             debug_mode,
             "[DEBUG] No LLVM IR files found, skipping llvm-link",
@@ -1251,9 +1552,10 @@ fn handle_link_command(
     debug_log(
         debug_mode,
         &format!(
-            "[DEBUG] LLVM IR merge: {} direct input(s), {} static archive(s)",
+            "[DEBUG] LLVM IR merge: {} direct input(s), {} selected static archive(s), {} whole static archive(s)",
             direct_llvm_ir_files.len(),
-            static_llvm_archives.len()
+            static_llvm_archives.len(),
+            whole_llvm_archives.len()
         ),
     );
     match merge_llvm_ir(
@@ -1261,6 +1563,7 @@ fn handle_link_command(
         &llvm_link_output,
         &direct_llvm_ir_files,
         &static_llvm_archives,
+        &whole_llvm_archives,
         &log_file,
     ) {
         Ok(()) => {

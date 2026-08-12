@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-md5 = "0.7"
 hex = "0.4"
 goblin = "0.10"
 pathdiff = "0.2"

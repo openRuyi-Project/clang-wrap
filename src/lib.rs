@@ -769,6 +769,11 @@ pub fn expand_at_file_args(args: &[String], debug_mode: bool) -> Result<Vec<Stri
 #[cfg(test)]
 mod response_file_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // `current_dir` is process-global. Keep these tests serial so their
+    // temporary response-file roots cannot be observed by each other.
+    static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_dir(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("clang-wrap-{name}-{}", std::process::id()));
@@ -779,6 +784,7 @@ mod response_file_tests {
 
     #[test]
     fn response_files_expand_recursively_relative_to_their_parent() {
+        let _current_dir_guard = CURRENT_DIR_LOCK.lock().unwrap();
         let root = test_dir("response-nested");
         let nested = root.join("nested");
         fs::create_dir_all(&nested).unwrap();
@@ -800,6 +806,7 @@ mod response_file_tests {
 
     #[test]
     fn response_file_cycles_are_rejected() {
+        let _current_dir_guard = CURRENT_DIR_LOCK.lock().unwrap();
         let root = test_dir("response-cycle");
         fs::write(root.join("first.rsp"), "@second.rsp\n").unwrap();
         fs::write(root.join("second.rsp"), "@first.rsp\n").unwrap();
