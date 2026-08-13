@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,6 +111,72 @@ fn command_exists(command: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+#[test]
+fn versioned_llvm_ar_alias_uses_the_matching_real_tool() {
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let bin_dir = root.join("bin");
+    let llvmir_dir = root.join("llvmir");
+    let object = root.join("member.o");
+    let archive = root.join("libmember.a");
+    let invocation_log = root.join("invocations");
+    let debug_log = llvmir_dir.join("clang-wrap-debug.log");
+    let wrapper = bin_dir.join("ar");
+    let llvm_ar_alias = bin_dir.join("llvm-ar-21");
+    let real_bin_dir = root.join("real-bin");
+    let real_llvm_ar = real_bin_dir.join("llvm-ar-21");
+
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&real_bin_dir).unwrap();
+    fs::copy(bin("ar"), &wrapper).unwrap();
+    unix_fs::symlink("ar", &llvm_ar_alias).unwrap();
+    write_file(&object, "native object");
+    write_file(&llvmir_path(&llvmir_dir, &object), "bitcode");
+    write_file(
+        &real_llvm_ar,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ntouch \"$2\"\n",
+            invocation_log.display()
+        ),
+    );
+    let mut permissions = fs::metadata(&real_llvm_ar).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&real_llvm_ar, permissions).unwrap();
+
+    let path = format!(
+        "{}:{}:{}",
+        bin_dir.display(),
+        real_bin_dir.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let status = Command::new(&llvm_ar_alias)
+        .current_dir(root)
+        .env("PATH", path)
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .env("EMIT_LLVMIR", "1")
+        .env("CLANG_WRAP_DEBUG", "1")
+        .args(["rcs", "libmember.a", "member.o"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(archive.exists());
+    assert!(llvmir_path(&llvmir_dir, &archive).exists());
+    assert_eq!(
+        fs::read_to_string(&invocation_log).unwrap().lines().count(),
+        2,
+        "the real llvm-ar should create the native and IR archives"
+    );
+    assert_eq!(
+        fs::read_to_string(&debug_log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("[DEBUG] Executing"))
+            .count(),
+        1,
+        "the IR archive command must not reenter the wrapper"
+    );
 }
 
 #[test]

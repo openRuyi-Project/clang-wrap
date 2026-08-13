@@ -305,8 +305,8 @@ test_pixman() {
 		cd ${pkg}-*
 		mkdir -p build-with-clangwrap && cd build-with-clangwrap
 		rm -rf ~/tmp/llvmir/`pwd`
-		CC=clang CXX=clang++ AR=ar meson setup --prefix=/usr . ..
-		meson compile -C . -j`nproc`
+		CC=clang CXX=clang++ meson setup --prefix=/usr . ..
+		meson compile -C . -j`nproc` -v
 		meson install -C . --destdir=`pwd`/install
 		meson-install meson-info/intro-installed.json `pwd`/install
 		triplet=`dpkg-architecture -qDEB_HOST_MULTIARCH`

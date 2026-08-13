@@ -205,22 +205,40 @@ fn main() {
         exit(0);
     }
 
-    // Prefer using CC or CXX environment variable to determine llvm-ar version.
-    let clang_cmd_for_version = env::var("CC")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| env::var("CXX").ok().filter(|s| !s.is_empty()))
-        .map(|s| {
-            // Extract filename from path
-            PathBuf::from(&s)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&s)
-                .to_string()
-        })
-        .unwrap_or_else(|| ar_cmd.to_string());
+    // Prefer the version encoded in the invoked llvm-ar name. This matters
+    // when `llvm-ar-21 -> ar`: the matching real tool must be llvm-ar-21,
+    // even if CC is unset (or names a different compiler version).
+    let clang_cmd_for_version = if let Some(version) = ar_cmd.strip_prefix("llvm-ar-") {
+        format!("clang-{version}")
+    } else {
+        env::var("CC")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| env::var("CXX").ok().filter(|s| !s.is_empty()))
+            .map(|s| {
+                // Extract filename from path
+                PathBuf::from(&s)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&s)
+                    .to_string()
+            })
+            .unwrap_or_else(|| ar_cmd.to_string())
+    };
 
-    let llvm_ar_path = find_llvm_tool("llvm-ar", &clang_cmd_for_version);
+    let mut llvm_ar_path = find_llvm_tool("llvm-ar", &clang_cmd_for_version);
+    // When this wrapper is installed as `llvm-ar -> ar`, `find_llvm_tool`
+    // can return the wrapper itself from PATH. The native archive invocation
+    // above already excludes self through get_exe_path; do the same for the
+    // IR archive invocation to avoid a second wrapper pass.
+    if let (Ok(current_exe), Ok(found_exe)) = (
+        env::current_exe().and_then(|path| path.canonicalize()),
+        llvm_ar_path.canonicalize(),
+    ) {
+        if current_exe == found_exe {
+            llvm_ar_path = get_exe_path(ar_cmd);
+        }
+    }
 
     debug_log(
         debug,

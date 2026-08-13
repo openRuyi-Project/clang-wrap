@@ -56,12 +56,12 @@ install-links:
 			[ -d "$$dir" ] || continue
 			dir_real="$$(cd "$$dir" 2>/dev/null && pwd -P)" || continue
 			[ "$$dir_real" != "$$bindir" ] || continue
-			for path in "$$dir"/llvm-ar "$$dir"/*-*-ar; do
+			for path in "$$dir"/llvm-ar "$$dir"/llvm-ar-[0-9]* "$$dir"/*-*-ar; do
 				[ -e "$$path" ] || continue
 				[ -x "$$path" ] || continue
 				name="$${path##*/}"
 				[[ "$$name" != gcc-ar && "$$name" != *-gcc-ar ]] || continue
-				[[ "$$name" = llvm-ar || "$$name" =~ ^[[:alnum:]_][[:alnum:]_.+]*(-[[:alnum:]_][[:alnum:]_.+]*){2,}-ar$$ ]] || continue
+				[[ "$$name" =~ ^llvm-ar(-[0-9]+)?$$ || "$$name" =~ ^[[:alnum:]_][[:alnum:]_.+]*(-[[:alnum:]_][[:alnum:]_.+]*){2,}-ar$$ ]] || continue
 				printf '%s\n' "$$name"
 			done
 		done | sort -u
