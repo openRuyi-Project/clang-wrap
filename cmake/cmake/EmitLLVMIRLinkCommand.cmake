@@ -363,12 +363,20 @@ foreach(_argument IN LISTS _arguments)
       # Its C/C++ bitcode was merged during the build, while any native
       # members were copied to asm/ above. Do not retain an archive dependency.
     elseif(_argument IN_LIST PROJECT_SHARED_LIBRARIES OR _argument_name IN_LIST PROJECT_SHARED_LIBRARIES)
-      # Relink scripts are independently executable.  Refer to the installed
-      # native library directly instead of relying on another _cmd script to
-      # have populated an output directory first. The native command can use
-      # paths relative to its target build directory (for example ../lib/),
-      # which do not apply to the installed llvmir directory.
-      list(APPEND _link_arguments "../${_argument_name}")
+      # Relink scripts must find project shared libraries through the system
+      # linker search path.  Do not retain a build-tree-relative path: the
+      # installed library may be in lib64 while this script lives in lib/llvmir-bin.
+      set(_project_shared_library "${_argument}")
+      if(NOT IS_ABSOLUTE "${_project_shared_library}")
+        set(_project_shared_library "${TARGET_BINARY_DIR}/${_project_shared_library}")
+      endif()
+      _cmake_emit_llvmir_append_shared_library_soname(
+        "${_project_shared_library}" "${_argument_name}" _project_shared_link_argument)
+      if(_project_shared_link_argument MATCHES "^-l:")
+        list(APPEND _link_arguments "${_project_shared_link_argument}")
+      else()
+        list(APPEND _link_arguments "-l:${_argument_name}")
+      endif()
     elseif(IS_ABSOLUTE "${_argument}" AND EXISTS "${_argument}" AND
            _argument_name MATCHES "^.+\.so(\.[^/]+)*$")
       # Development packages commonly expose libfoo.so as a symlink while
@@ -383,9 +391,18 @@ foreach(_argument IN LISTS _arguments)
       if(_shared_library_base IN_LIST PROJECT_SHARED_LIBRARIES)
         # CMake target metadata can expose an unversioned OUTPUT_NAME while
         # the native command links the ELF SONAME (for example libfoo.so.1).
-        # Preserve the native versioned basename but relocate it beside the
-        # installed llvmir directory.
-        list(APPEND _link_arguments "../${_argument_name}")
+        # The system linker resolves the exact SONAME in standard lib dirs.
+        set(_project_shared_library "${_argument}")
+        if(NOT IS_ABSOLUTE "${_project_shared_library}")
+          set(_project_shared_library "${TARGET_BINARY_DIR}/${_project_shared_library}")
+        endif()
+        _cmake_emit_llvmir_append_shared_library_soname(
+          "${_project_shared_library}" "${_argument_name}" _project_shared_link_argument)
+        if(_project_shared_link_argument MATCHES "^-l:")
+          list(APPEND _link_arguments "${_project_shared_link_argument}")
+        else()
+          list(APPEND _link_arguments "-l:${_argument_name}")
+        endif()
       else()
         list(APPEND _link_arguments "${_argument}")
       endif()
@@ -393,9 +410,14 @@ foreach(_argument IN LISTS _arguments)
            _argument_name MATCHES "^.+\\.so(\\.[^/]+)*$" AND
            EXISTS "${TARGET_BINARY_DIR}/${_argument_name}")
       # Some projects link tools with a bare versioned shared-library filename
-      # instead of a CMake target. The installed script runs from llvmir-bin,
-      # while the matching library lives in the sibling llvmir directory.
-      list(APPEND _link_arguments "../${_argument_name}")
+      # instead of a CMake target. Let the system linker resolve its SONAME.
+      _cmake_emit_llvmir_append_shared_library_soname(
+        "${TARGET_BINARY_DIR}/${_argument_name}" "${_argument_name}" _bare_shared_link_argument)
+      if(_bare_shared_link_argument MATCHES "^-l:")
+        list(APPEND _link_arguments "${_bare_shared_link_argument}")
+      else()
+        list(APPEND _link_arguments "-l:${_argument_name}")
+      endif()
     elseif(_argument_name MATCHES "^.+\\.(o|a)$")
       # An explicit object or an archive that is not a project CMake target
       # has no emitted-IR/sidecar contract. Preserve it as a native fallback

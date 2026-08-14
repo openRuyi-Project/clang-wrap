@@ -63,8 +63,10 @@ set(_external_archive_bc "${TEST_OUTPUT_DIR}/libexternal_archive_shared.so.1.bc"
 set(_debug_postfix_bc "${TEST_OUTPUT_DIR}/debug_postfix_app_dbg.bc")
 set(_versioned_debug_bc "${TEST_OUTPUT_DIR}/libversioned_shared_dbg.so.2.bc")
 set(_versioned_script_name "libversioned_shared.so.2_cmd")
+set(_versioned_shared_soname "libversioned_shared.so.2")
 if(TEST_BUILD_TYPE STREQUAL "Debug")
   set(_versioned_script_name "libversioned_shared_dbg.so.2_cmd")
+  set(_versioned_shared_soname "libversioned_shared_dbg.so.2")
 endif()
 if(CASE_MODE STREQUAL "ON")
   if(NOT EXISTS "${_selected_bc}" OR NOT EXISTS "${_unselected_bc}" OR NOT EXISTS "${_nested_bc}" OR
@@ -339,6 +341,12 @@ if(CASE_MODE STREQUAL "ON")
   if(NOT _static_shared_relink_result EQUAL 0 OR
      NOT EXISTS "${_install_prefix}/lib/llvmir-bin/output/static_shared_consumer")
     message(FATAL_ERROR "Static-library transitive shared-library relink failed:\n${_static_shared_relink_error}")
+  endif()
+  file(READ "${_install_prefix}/lib/llvmir-bin/static_shared_consumer_cmd" _static_shared_consumer_script)
+  string(REPLACE "." "\\." _versioned_shared_soname_pattern "${_versioned_shared_soname}")
+  if(NOT _static_shared_consumer_script MATCHES "'-l:${_versioned_shared_soname_pattern}'" OR
+     _static_shared_consumer_script MATCHES "\\.\\./libversioned_shared")
+    message(FATAL_ERROR "Project shared-library dependency was not normalized to -l:SONAME:\n${_static_shared_consumer_script}")
   endif()
   file(READ "${_install_prefix}/lib/llvmir-bin/cycle_app_cmd" _cycle_script)
   if(_cycle_script MATCHES "libcycle_a\\.a" OR
