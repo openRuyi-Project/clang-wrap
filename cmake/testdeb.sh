@@ -503,8 +503,8 @@ test_libjpeg_turbo() {
     mkdir -p "$build_dir"
     cd "$build_dir"
 
-    print_info "配置项目（同时构建静态库和动态库）..."
-    CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
+    print_info "配置项目（同时构建静态库和动态库，并注入 -ffat-lto-objects）..."
+    LDFLAGS="-ffat-lto-objects" CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
         -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
         -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
         -DCMAKE_BUILD_TYPE=Release \
@@ -517,6 +517,12 @@ test_libjpeg_turbo() {
 
     print_info "构建项目..."
     cmake --build . -j$(nproc) -v
+
+    if ! rg -l -g link.txt --fixed-strings -- "-ffat-lto-objects" "$build_dir/CMakeFiles" > /dev/null; then
+        print_error "原生链接命令未包含 LDFLAGS 中的 -ffat-lto-objects"
+        return 1
+    fi
+    print_success "原生链接命令包含 -ffat-lto-objects"
 
     print_info "安装项目..."
     cmake --install . --prefix "$install_dir"
@@ -539,6 +545,19 @@ test_libjpeg_turbo() {
             print_info "验证动态库位码..."
             llvm-dis-22 "$install_dir/lib/llvmir/"*.so*.bc -o - 2>/dev/null | head -10
             print_success "动态库位码验证通过"
+
+            local cmd_files=()
+            mapfile -t cmd_files < <(find "$install_dir/lib/llvmir" "$install_dir/lib/llvmir-bin" \
+                -type f -name '*_cmd' -print 2>/dev/null)
+            if [ "${#cmd_files[@]}" -eq 0 ]; then
+                print_error "未找到用于检查 -ffat-lto-objects 的 _cmd 文件"
+                return 1
+            fi
+            if rg -n --fixed-strings -- "-ffat-lto-objects" "${cmd_files[@]}"; then
+                print_error "生成的 _cmd 保留了 -ffat-lto-objects"
+                return 1
+            fi
+            print_success "生成的 _cmd 已过滤 -ffat-lto-objects"
             
             print_info "测试动态库链接脚本..."
             test_link_scripts "$install_dir"

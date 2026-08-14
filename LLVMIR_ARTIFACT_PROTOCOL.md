@@ -48,7 +48,7 @@
 2. 若存在 `_cmd`，它是 mode `0755` 的 Bash 脚本，使用 Bash array quoting、`set -e`、`mkdir -p output` 与 `--output=output/N`。其命令包含 `-fuse-ld=lld`、`-x ir`，并记录 `# Clang version: ...`。
 3. `_cmd` 必须能从自身所在目录执行；其随包 native fallback 和版本脚本必须以 `./asm/...`、`./N_verscript` 等相对路径引用。
 4. `asm/<id>-<name>` 的 `id` 为原 native 输入**绝对路径** SHA-256 的前 12 位；`name` 是 basename。这是两个入口已经靠近的命名约定。
-5. 已分类的编译期参数不会作为重链依赖保留：包括 include/macro/PCH/resource-dir、`-isysroot`、`-Xclang`、`-Xpreprocessor` 和 prefix-map 等。
+5. 已分类的编译期参数不会作为重链依赖保留：包括 include/macro/PCH/resource-dir、`-isysroot`、`-Xclang`、`-Xpreprocessor`、prefix-map 和 `-ffat-lto-objects` 等。后者只控制原生编译产物的 LTO 对象形态；`_cmd` 重链的是已生成的 bitcode，必须移除该选项。
 6. 已分类的构建期链接搜索信息不会进入安装脚本：原始 `-L`、dependency-file、`rpath-link` 和非 `$ORIGIN` rpath 被删除；可解析共享库可被规范化为 `-l:SONAME`。group/whole-archive 等状态参数应保留。
 7. 版本脚本若被支持并复制，脚本引用的是同目录 `-Wl,--version-script=./N_verscript`，而不是构建树原路径。
 

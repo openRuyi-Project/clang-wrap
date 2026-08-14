@@ -71,10 +71,10 @@ function(_generate name command expect_failure version_script_name version_scrip
 endfunction()
 
 _generate(portable
-  "${CMAKE_C_COMPILER} -isysroot /private/build/sysroot -I/private/build/include -Xclang -ast-dump -L${WORK_DIR} -lportable-dep -Xlinker --dependency-file=CMakeFiles/fixture.dir/link.d -Xlinker --dependency-file -Xlinker CMakeFiles/fixture.dir/split-link.d -Xlinker -rpath-link -Xlinker /private/build/xlinker-lib -Xlinker --rpath-link=/private/build/xlinker-equals-lib -rpath-link /private/build/direct-lib -Wl,--dependency-file,CMakeFiles/fixture.dir/wl-link.d -Wl,-rpath-link,/private/build/wl-lib -Wl,--start-group -Wl,--whole-archive -Wl,--no-whole-archive -Wl,--end-group -Wl,-rpath,\\$ORIGIN/../lib -o fixture"
+  "${CMAKE_C_COMPILER} -isysroot /private/build/sysroot -I/private/build/include -Xclang -ast-dump -ffat-lto-objects -L${WORK_DIR} -lportable-dep -Xlinker --dependency-file=CMakeFiles/fixture.dir/link.d -Xlinker --dependency-file -Xlinker CMakeFiles/fixture.dir/split-link.d -Xlinker -rpath-link -Xlinker /private/build/xlinker-lib -Xlinker --rpath-link=/private/build/xlinker-equals-lib -rpath-link /private/build/direct-lib -Wl,--dependency-file,CMakeFiles/fixture.dir/wl-link.d -Wl,-rpath-link,/private/build/wl-lib -Wl,--start-group -Wl,--whole-archive -Wl,--no-whole-archive -Wl,--end-group -Wl,-rpath,\\$ORIGIN/../lib -o fixture"
   FALSE "" "")
 
-foreach(_removed IN ITEMS -isysroot /private/build/sysroot -I/private/build/include -Xclang -ast-dump "-L${WORK_DIR}")
+foreach(_removed IN ITEMS -isysroot /private/build/sysroot -I/private/build/include -Xclang -ast-dump -ffat-lto-objects "-L${WORK_DIR}")
   string(FIND "${portable_SCRIPT}" "${_removed}" _position)
   if(NOT _position EQUAL -1)
     message(FATAL_ERROR "Portable script retained compiler/build option '${_removed}':\n${portable_SCRIPT}")

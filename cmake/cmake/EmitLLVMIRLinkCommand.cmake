@@ -202,7 +202,7 @@ foreach(_argument IN LISTS _arguments)
          _argument STREQUAL "-Xpreprocessor")
     set(_skip_compiler_only_value TRUE)
   elseif(_argument STREQUAL "-nostdinc" OR _argument STREQUAL "-nostdinc++" OR
-         _argument STREQUAL "-fsyntax-only" OR
+         _argument STREQUAL "-fsyntax-only" OR _argument STREQUAL "-ffat-lto-objects" OR
          _argument MATCHES "^-D.+" OR _argument MATCHES "^-U.+" OR
          _argument MATCHES "^-I.+" OR _argument MATCHES "^-F.+" OR
          _argument MATCHES "^-(include|imacros|include-pch|idirafter|iprefix|iwithprefix|iwithprefixbefore|isystem|iquote|isysroot|resource-dir)=" OR
