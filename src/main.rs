@@ -307,6 +307,40 @@ mod tests {
     }
 
     #[test]
+    fn split_long_version_script_option_is_rewritten_to_installed_sidecar() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-cmd-long-verscript-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bitcode = dir.join("program.bc");
+        let args = vec![
+            "program.o".to_string(),
+            "-Wl,--version-script".to_string(),
+            "-Wl,../src/libpcre2-8.sym".to_string(),
+        ];
+
+        generate_link_cmd_file(
+            Path::new("/bin/false"),
+            &bitcode,
+            Path::new("program"),
+            &args,
+            &[],
+            false,
+            Some(Path::new("/artifact/program_verscript")),
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let script = fs::read_to_string(format!("{}_cmd", bitcode.display())).unwrap();
+        assert!(script.contains("-Wl,--version-script=./program_verscript"));
+        assert!(!script.contains("../src/libpcre2-8.sym"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn cmd_searches_parent_install_library_directory() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1278,7 +1312,7 @@ fn handle_link_command(
                 format!("-Wl,--version-script={}", path)
             } else if let Some(path) = arg.strip_prefix("-Wl,--version-script,") {
                 format!("-Wl,--version-script={}", path)
-            } else if arg == "-Wl,-version-script" {
+            } else if arg == "-Wl,-version-script" || arg == "-Wl,--version-script" {
                 if i + 1 < args.len() && args[i + 1].starts_with("-Wl,") {
                     let next_arg = &args[i + 1];
                     let path = next_arg.strip_prefix("-Wl,").unwrap_or(next_arg);
