@@ -193,11 +193,31 @@ fn destination_filename(file: &Path, files: &[PathBuf], source: &Path, installed
     {
         return name.strip_suffix('T').unwrap_or(name).to_string();
     }
-    name.to_string()
+    let installed_name = installed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name);
+    if name.ends_with("_cmd") {
+        return format!("{installed_name}_cmd");
+    }
+    if name.ends_with("_verscript") {
+        return format!("{installed_name}_verscript");
+    }
+    if name.ends_with("_missing") {
+        return format!("{installed_name}_missing");
+    }
+    if name.ends_with(".bc") {
+        return format!("{installed_name}.bc");
+    }
+    installed_name.to_string()
 }
 
 fn rewrite_cmd(content: &str, source_name: &str, destination_name: &str) -> String {
+    let verscript_marker = format!("__clang_wrap_{source_name}_verscript__");
     content
+        // Protect the version-script basename while replacing the main output
+        // basename, since the latter is also a prefix of the former.
+        .replace(&format!("{source_name}_verscript"), &verscript_marker)
         .replace(
             &format!("# Original output: {source_name}"),
             &format!("# Original output: {destination_name}"),
@@ -211,9 +231,14 @@ fn rewrite_cmd(content: &str, source_name: &str, destination_name: &str) -> Stri
             &format!("output/{destination_name}"),
         )
         .replace(
-            &format!("{source_name}_verscript"),
-            &format!("{destination_name}_verscript"),
+            &format!("--output={source_name}"),
+            &format!("--output={destination_name}"),
         )
+        .replace(
+            &format!("-o {source_name}"),
+            &format!("-o {destination_name}"),
+        )
+        .replace(&verscript_marker, &format!("{destination_name}_verscript"))
 }
 
 fn copy_llvmir_file(source: &Path, destination: &Path) -> io::Result<()> {

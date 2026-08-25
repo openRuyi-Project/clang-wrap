@@ -474,6 +474,54 @@ fn install_shared_library_rewrites_installed_cmd_content() {
 }
 
 #[test]
+fn install_executable_rename_rewrites_llvmir_and_cmd_content() {
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let source = root.join("demo");
+    let target = root.join("image/usr/bin/renamed-demo");
+    let source_ir = llvmir_path(&llvmir_dir, &source);
+    let source_cmd = PathBuf::from(format!("{}_cmd", source_ir.display()));
+    let source_verscript = PathBuf::from(format!("{}_verscript", source_ir.display()));
+
+    write_file(&source, "executable-placeholder");
+    write_file(&source_ir, "bitcode");
+    write_file(&source_verscript, "VERSCRIPT");
+    write_file(
+        &source_cmd,
+        "#!/bin/bash\n# Original output: demo\ncmd=(\n  clang\n  ./demo\n  -Wl,--version-script=./demo_verscript\n  --output=output/demo\n)\n\"${cmd[@]}\"\n",
+    );
+    fs::create_dir_all(target.parent().expect("target should have parent"))
+        .expect("failed to create install directory");
+
+    run_wrapper(
+        "install",
+        root,
+        &llvmir_dir,
+        &["demo", "image/usr/bin/renamed-demo"],
+    );
+
+    let installed_dir = root.join("image/usr/lib/llvmir-bin");
+    let installed_ir = installed_dir.join("renamed-demo");
+    let installed_cmd = installed_dir.join("renamed-demo_cmd");
+    let installed_verscript = installed_dir.join("renamed-demo_verscript");
+    let script = fs::read_to_string(&installed_cmd).expect("failed to read installed _cmd");
+
+    assert!(target.exists());
+    assert!(installed_ir.exists());
+    assert!(installed_cmd.exists());
+    assert!(installed_verscript.exists());
+    assert!(!installed_dir.join("demo").exists());
+    assert!(!installed_dir.join("demo_cmd").exists());
+    assert!(script.contains("# Original output: renamed-demo"));
+    assert!(script.contains("./renamed-demo"));
+    assert!(script.contains("-Wl,--version-script=./renamed-demo_verscript"));
+    assert!(script.contains("--output=output/renamed-demo"));
+    assert!(!script.contains("./demo"));
+    assert!(!script.contains("output/demo"));
+}
+
+#[test]
 fn install_shared_library_temp_t_uses_soname_for_installed_ir() {
     let test_dir = TestDir::new();
     let root = test_dir.path();
