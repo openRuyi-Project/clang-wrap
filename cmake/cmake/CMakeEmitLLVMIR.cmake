@@ -68,7 +68,13 @@ function(install)
   list(FIND ARGN "TARGETS" _targets_index)
   if(NOT _targets_index EQUAL -1)
     set(_runtime_destination "")
+    set(_library_destination "")
+    set(_module_destination "")
+    set(_generic_destination "")
     set(_expect_runtime_destination FALSE)
+    set(_expect_library_destination FALSE)
+    set(_expect_module_destination FALSE)
+    set(_expect_generic_destination FALSE)
     foreach(_argument IN LISTS ARGN)
       if(_expect_runtime_destination)
         if(_argument STREQUAL "DESTINATION")
@@ -77,8 +83,35 @@ function(install)
           set(_runtime_destination "${_argument}")
           set(_expect_runtime_destination FALSE)
         endif()
+      elseif(_expect_library_destination)
+        if(_argument STREQUAL "DESTINATION")
+          set(_expect_library_destination TRUE)
+        else()
+          set(_library_destination "${_argument}")
+          set(_expect_library_destination FALSE)
+        endif()
+      elseif(_expect_module_destination)
+        if(_argument STREQUAL "DESTINATION")
+          set(_expect_module_destination TRUE)
+        else()
+          set(_module_destination "${_argument}")
+          set(_expect_module_destination FALSE)
+        endif()
+      elseif(_expect_generic_destination)
+        if(_argument STREQUAL "DESTINATION")
+          set(_expect_generic_destination TRUE)
+        else()
+          set(_generic_destination "${_argument}")
+          set(_expect_generic_destination FALSE)
+        endif()
       elseif(_argument STREQUAL "RUNTIME")
         set(_expect_runtime_destination TRUE)
+      elseif(_argument STREQUAL "LIBRARY")
+        set(_expect_library_destination TRUE)
+      elseif(_argument STREQUAL "MODULE")
+        set(_expect_module_destination TRUE)
+      elseif(_argument STREQUAL "DESTINATION")
+        set(_expect_generic_destination TRUE)
       endif()
     endforeach()
     # Target names are unambiguous CMake objects. Scanning for them avoids a
@@ -95,13 +128,35 @@ function(install)
           set_property(TARGET "${_target}" PROPERTY
             EMIT_LLVMIR_RUNTIME_INSTALL_DESTINATION "${_runtime_destination}")
         endif()
+        if(_target_type STREQUAL "MODULE_LIBRARY")
+          if(_module_destination)
+            set(_target_install_destination "${_module_destination}")
+          elseif(_library_destination)
+            set(_target_install_destination "${_library_destination}")
+          else()
+            set(_target_install_destination "${_generic_destination}")
+          endif()
+          if(_target_install_destination)
+            set_property(TARGET "${_target}" PROPERTY
+              EMIT_LLVMIR_INSTALL_DESTINATION "${_target_install_destination}")
+          endif()
+        endif()
         endif()
       endif()
     endforeach()
   endif()
   
-  # Call original install command with all arguments
-  _install(${ARGN})
+  # Forward every argument as an explicitly quoted argument. In particular,
+  # this preserves empty PATTERN/REGEX values used by projects such as MariaDB;
+  # an unquoted ${ARGN} drops empty list elements and turns `PATTERN "" EXCLUDE`
+  # into `PATTERN EXCLUDE`.
+  set(_install_call "")
+  foreach(_argument IN LISTS ARGN)
+    string(REPLACE "\\" "\\\\" _escaped_argument "${_argument}")
+    string(REPLACE "\"" "\\\"" _escaped_argument "${_escaped_argument}")
+    string(APPEND _install_call " \"${_escaped_argument}\"")
+  endforeach()
+  cmake_language(EVAL CODE "_install(${_install_call})")
 endfunction()
 
 # ============================================================================
@@ -189,28 +244,29 @@ get_filename_component(_llvm_bin_dir "${_clang_realpath}" DIRECTORY)
 # Build LLVM tool names with same suffix
 # Try with suffix first, then without suffix (for brew installations where
 # clang has version but llvm tools don't)
-set(_llvm_tools llvm-link llvm-ar)
+set(_llvm_tools llvm-link llvm-ar llvm-nm)
 foreach(_tool IN LISTS _llvm_tools)
+  string(REPLACE "-" "_" _tool_variable "${_tool}")
   # Search in LLVM bin directory: first with suffix, then without
-  find_program(LLVM_${_tool}_EXECUTABLE
+  find_program(CMAKE_EMIT_LLVMIR_${_tool_variable}_EXECUTABLE
     NAMES ${_tool}${_clang_suffix} ${_tool}
     HINTS "${_llvm_bin_dir}"
     NO_DEFAULT_PATH
   )
-  mark_as_advanced(LLVM_${_tool}_EXECUTABLE)
+  mark_as_advanced(CMAKE_EMIT_LLVMIR_${_tool_variable}_EXECUTABLE)
 
   # If not found in LLVM bin directory, search in PATH
   # This handles cases where llvm-link-22 is in /usr/bin
-  if(NOT LLVM_${_tool}_EXECUTABLE)
-    find_program(LLVM_${_tool}_EXECUTABLE
+  if(NOT CMAKE_EMIT_LLVMIR_${_tool_variable}_EXECUTABLE)
+    find_program(CMAKE_EMIT_LLVMIR_${_tool_variable}_EXECUTABLE
       NAMES ${_tool}${_clang_suffix}
     )
-    mark_as_advanced(LLVM_${_tool}_EXECUTABLE)
+    mark_as_advanced(CMAKE_EMIT_LLVMIR_${_tool_variable}_EXECUTABLE)
   endif()
 endforeach()
 
 # llvm-link is required
-if(NOT LLVM_llvm-link_EXECUTABLE)
+if(NOT CMAKE_EMIT_LLVMIR_llvm_link_EXECUTABLE)
   if(_clang_suffix)
     # Tried to find llvm-link with specific version
     message(FATAL_ERROR "CMAKE_EMIT_LLVMIR is set, but llvm-link matching the compiler version was not found. "
@@ -225,15 +281,18 @@ if(NOT LLVM_llvm-link_EXECUTABLE)
                         "Please ensure LLVM tools are installed and in your PATH.")
   endif()
 endif()
-if(NOT LLVM_llvm-ar_EXECUTABLE)
+if(NOT CMAKE_EMIT_LLVMIR_llvm_ar_EXECUTABLE)
   message(FATAL_ERROR "CMAKE_EMIT_LLVMIR is set, but llvm-ar matching the compiler version was not found.")
+endif()
+if(NOT CMAKE_EMIT_LLVMIR_llvm_nm_EXECUTABLE)
+  message(FATAL_ERROR "CMAKE_EMIT_LLVMIR is set, but llvm-nm matching the compiler version was not found.")
 endif()
 
 # If fallback was used (no suffix), verify version matches clang major version
-if(_clang_suffix AND NOT LLVM_llvm-link_EXECUTABLE MATCHES "${_clang_suffix}$")
+if(_clang_suffix AND NOT CMAKE_EMIT_LLVMIR_llvm_link_EXECUTABLE MATCHES "${_clang_suffix}$")
   # Extract version from llvm-link
   execute_process(
-    COMMAND "${LLVM_llvm-link_EXECUTABLE}" --version
+    COMMAND "${CMAKE_EMIT_LLVMIR_llvm_link_EXECUTABLE}" --version
     OUTPUT_VARIABLE _llvm_link_output
     ERROR_VARIABLE _llvm_link_error
     OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -241,7 +300,7 @@ if(_clang_suffix AND NOT LLVM_llvm-link_EXECUTABLE MATCHES "${_clang_suffix}$")
   )
   
   if(_llvm_link_output MATCHES "version ([0-9]+)")
-    set(_llvm_link_major "${CMAKE_MATCH_1}")
+      set(_llvm_link_major "${CMAKE_MATCH_1}")
     string(SUBSTRING "${_clang_suffix}" 1 -1 _clang_major)
     
     if(NOT _llvm_link_major STREQUAL _clang_major)
@@ -254,7 +313,7 @@ endif()
 
 # Get LLVM version from llvm-link
 execute_process(
-  COMMAND "${LLVM_llvm-link_EXECUTABLE}" --version
+  COMMAND "${CMAKE_EMIT_LLVMIR_llvm_link_EXECUTABLE}" --version
   OUTPUT_VARIABLE _llvm_link_output
   ERROR_VARIABLE _llvm_link_error
   OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -456,7 +515,17 @@ function(_cmake_emit_llvmir_get_target_output_names target ir_name_var native_na
 
   set(_ir_name "${_base_name}${_suffix}")
   set(_native_name "${_ir_name}")
-  if(_version AND _target_type MATCHES "^(SHARED_LIBRARY|MODULE_LIBRARY)$")
+  if((NOT _version STREQUAL "_version-NOTFOUND" AND NOT _version STREQUAL "") OR
+     (NOT _soversion STREQUAL "_soversion-NOTFOUND" AND NOT _soversion STREQUAL ""))
+    if(NOT _target_type MATCHES "^(SHARED_LIBRARY|MODULE_LIBRARY)$")
+      set(_has_library_version FALSE)
+    else()
+      set(_has_library_version TRUE)
+    endif()
+  else()
+    set(_has_library_version FALSE)
+  endif()
+  if(_has_library_version)
     # SOVERSION may legitimately be "0", which CMake treats as false in a
     # bare if() condition. Check only whether the property was found.
     if(NOT _soversion STREQUAL "_soversion-NOTFOUND")
@@ -464,7 +533,12 @@ function(_cmake_emit_llvmir_get_target_output_names target ir_name_var native_na
     else()
       set(_ir_name "${_base_name}${_suffix}.${_version}")
     endif()
-    set(_native_name "${_base_name}${_suffix}.${_version}")
+    if(NOT _soversion STREQUAL "_soversion-NOTFOUND" AND NOT _soversion STREQUAL "")
+      set(_native_version "${_soversion}")
+    else()
+      set(_native_version "${_version}")
+    endif()
+    set(_native_name "${_base_name}${_suffix}.${_native_version}")
   endif()
   set(${ir_name_var} "${_ir_name}" PARENT_SCOPE)
   set(${native_name_var} "${_native_name}" PARENT_SCOPE)
@@ -488,6 +562,33 @@ function(_cmake_emit_llvmir_normalize_link_target item result_var)
   endif()
 endfunction()
 
+# Some projects merge static libraries with an MRI script instead of exposing
+# those libraries through target_link_libraries().  MariaDB's
+# MERGE_LIBRARIES(), for example, writes ADDLIB $<TARGET_FILE:foo> entries to
+# <target>-<config>.mri.tpl.  Treat those entries as ordinary static target
+# dependencies so their LLVM archives are included in consumers.
+function(_cmake_emit_llvmir_collect_mri_targets target result_var)
+  set(_outputs "")
+  get_target_property(_target_binary_dir ${target} BINARY_DIR)
+  if(NOT _target_binary_dir OR _target_binary_dir STREQUAL "_target_binary_dir-NOTFOUND")
+    set(_target_binary_dir "${CMAKE_CURRENT_BINARY_DIR}")
+  endif()
+  set(_mri_template "${_target_binary_dir}/${target}-$<CONFIG>.mri.tpl")
+  if(EXISTS "${_mri_template}")
+    file(STRINGS "${_mri_template}" _mri_lines)
+    foreach(_mri_line IN LISTS _mri_lines)
+      if(_mri_line MATCHES "^[ \\t]*ADDLIB[ \\t]+\\$<TARGET_FILE:([^>]+)>")
+        set(_mri_target "${CMAKE_MATCH_1}")
+        if(TARGET "${_mri_target}")
+          list(APPEND _outputs "${_mri_target}")
+        endif()
+      endif()
+    endforeach()
+  endif()
+  list(REMOVE_DUPLICATES _outputs)
+  set(${result_var} "${_outputs}" PARENT_SCOPE)
+endfunction()
+
 function(_cmake_emit_llvmir_collect_static_bitcode target result_var visited_targets)
   set(_outputs "")
   list(FIND visited_targets "${target}" _cycle_index)
@@ -499,6 +600,8 @@ function(_cmake_emit_llvmir_collect_static_bitcode target result_var visited_tar
   get_target_property(_libraries ${target} LINK_LIBRARIES)
   get_target_property(_interface_libraries ${target} INTERFACE_LINK_LIBRARIES)
   list(APPEND _libraries ${_interface_libraries})
+  _cmake_emit_llvmir_collect_mri_targets(${target} _mri_libraries)
+  list(APPEND _libraries ${_mri_libraries})
   foreach(_library IN LISTS _libraries)
     _cmake_emit_llvmir_normalize_link_target("${_library}" _library)
     if(_library)
@@ -572,6 +675,8 @@ function(_cmake_emit_llvmir_collect_static_native_member_files target result_var
     get_target_property(_libraries ${target} LINK_LIBRARIES)
     get_target_property(_interface_libraries ${target} INTERFACE_LINK_LIBRARIES)
     list(APPEND _libraries ${_interface_libraries})
+    _cmake_emit_llvmir_collect_mri_targets(${target} _mri_libraries)
+    list(APPEND _libraries ${_mri_libraries})
     foreach(_library IN LISTS _libraries)
       _cmake_emit_llvmir_normalize_link_target("${_library}" _library)
       if(_library)
@@ -615,6 +720,8 @@ function(_cmake_emit_llvmir_collect_static_targets target result_var visited_tar
   get_target_property(_libraries ${target} LINK_LIBRARIES)
   get_target_property(_interface_libraries ${target} INTERFACE_LINK_LIBRARIES)
   list(APPEND _libraries ${_interface_libraries})
+  _cmake_emit_llvmir_collect_mri_targets(${target} _mri_libraries)
+  list(APPEND _libraries ${_mri_libraries})
   foreach(_library IN LISTS _libraries)
     _cmake_emit_llvmir_normalize_link_target("${_library}" _library)
     if(_library)
@@ -1035,6 +1142,8 @@ function(cmake_emit_llvmir_process_target target)
     _cmake_emit_llvmir_handle_exports(${target})
     get_target_property(_version_script_name ${target} EMIT_LLVMIR_VERSION_SCRIPT_NAME)
     get_target_property(_version_script_source ${target} EMIT_LLVMIR_VERSION_SCRIPT_SOURCE)
+    get_target_property(_dynamic_list_name ${target} EMIT_LLVMIR_DYNAMIC_LIST_NAME)
+    get_target_property(_dynamic_list_source ${target} EMIT_LLVMIR_DYNAMIC_LIST_SOURCE)
 
     set(_native_link_command "")
     set(_link_byproducts "")
@@ -1071,6 +1180,8 @@ function(cmake_emit_llvmir_process_target target)
         "-DOUTPUT_NAME=${_full_output_name}"
         "-DVERSION_SCRIPT_NAME=${_version_script_name}"
         "-DVERSION_SCRIPT_SOURCE=${_version_script_source}"
+        "-DDYNAMIC_LIST_NAME=${_dynamic_list_name}"
+        "-DDYNAMIC_LIST_SOURCE=${_dynamic_list_source}"
         "-DNATIVE_OUTPUT_NAME=${_native_output_name}"
         "-DSTATIC_MISSING_FILES=${_static_missing_files_argument}"
         "-DPROJECT_STATIC_LIBRARIES=${_project_static_libraries_argument}"
@@ -1091,7 +1202,7 @@ function(cmake_emit_llvmir_process_target target)
       list(JOIN _bc_files "," _archive_bc_files_argument)
       set(_archive_command
         ${CMAKE_COMMAND}
-        "-DLLVM_AR=${LLVM_llvm-ar_EXECUTABLE}"
+        "-DLLVM_AR=${CMAKE_EMIT_LLVMIR_llvm_ar_EXECUTABLE}"
         "-DARCHIVE_OUTPUT=${_primary_output}"
         "-DMISSING_FILE=${_primary_output}_missing"
         "-DNATIVE_LINK_FILE=${_target_binary_dir}/CMakeFiles/${target}.dir/link.txt"
@@ -1122,7 +1233,9 @@ function(cmake_emit_llvmir_process_target target)
           OUTPUT "${_primary_output}"
           BYPRODUCTS ${_link_byproducts}
           COMMAND ${CMAKE_COMMAND}
-            "-DLLVM_LINK=${LLVM_llvm-link_EXECUTABLE}"
+            "-DLLVM_LINK=${CMAKE_EMIT_LLVMIR_llvm_link_EXECUTABLE}"
+            "-DLLVM_NM=${CMAKE_EMIT_LLVMIR_llvm_nm_EXECUTABLE}"
+            "-DLLVM_AR=${CMAKE_EMIT_LLVMIR_llvm_ar_EXECUTABLE}"
             "-DOUTPUT=${_primary_output}"
             "-DDIRECT_BC_FILES=${_direct_bc_files_argument}"
             "-DSTATIC_BC_FILES=${_static_bc_files_argument}"
@@ -1199,6 +1312,7 @@ function(_cmake_emit_llvmir_handle_exports target)
   endif()
 
   set(_version_script_source "")
+  set(_dynamic_list_source "")
   set(_expect_xlinker_value FALSE)
   set(_expect_version_script_value FALSE)
   foreach(_option IN LISTS _link_options)
@@ -1223,6 +1337,9 @@ function(_cmake_emit_llvmir_handle_exports target)
     elseif(_option MATCHES "^-Wl,--?version-script[=,](.+)$")
       set(_version_script_source "${CMAKE_MATCH_1}")
       break()
+    elseif(_option MATCHES "^-Wl,--dynamic-list[=,](.+)$")
+      set(_dynamic_list_source "${CMAKE_MATCH_1}")
+      break()
     endif()
   endforeach()
 
@@ -1234,6 +1351,17 @@ function(_cmake_emit_llvmir_handle_exports target)
     set_property(TARGET ${target} APPEND PROPERTY EMIT_LLVMIR_ADDITIONAL_FILES "${_version_output}")
     set_property(TARGET ${target} PROPERTY EMIT_LLVMIR_VERSION_SCRIPT_NAME "${_verscript_name}")
     set_property(TARGET ${target} PROPERTY EMIT_LLVMIR_VERSION_SCRIPT_SOURCE "${_version_script_source}")
+  endif()
+
+  if(_dynamic_list_source)
+    set(_dynamic_list_name "${_output_name}_dynamiclist")
+    set(_dynamic_list_output "${_llvmir_output_subdir}/${_dynamic_list_name}")
+    if(EXISTS "${_dynamic_list_source}")
+      configure_file("${_dynamic_list_source}" "${_dynamic_list_output}" COPYONLY)
+    endif()
+    set_property(TARGET ${target} APPEND PROPERTY EMIT_LLVMIR_ADDITIONAL_FILES "${_dynamic_list_output}")
+    set_property(TARGET ${target} PROPERTY EMIT_LLVMIR_DYNAMIC_LIST_NAME "${_dynamic_list_name}")
+    set_property(TARGET ${target} PROPERTY EMIT_LLVMIR_DYNAMIC_LIST_SOURCE "${_dynamic_list_source}")
   endif()
 
   get_target_property(_version ${target} VERSION)
@@ -1292,10 +1420,35 @@ function(_cmake_emit_llvmir_setup_install target)
         set(_llvmir_install_dir "lib/${_llvmir_leaf}")
       endif()
     else()
-      set(_llvmir_install_dir "${CMAKE_INSTALL_LIBDIR}/llvmir-bin")
+      # Keep executable IR in the wrapper-compatible /lib/llvmir-bin layout.
+      # Unlike libraries, this directory is intentionally independent of
+      # CMAKE_INSTALL_LIBDIR (which may be lib64 on Fedora).
+      set(_llvmir_install_dir "lib/llvmir-bin")
     endif()
   else()
     set(_llvmir_install_dir "${CMAKE_EMIT_LLVMIR_INSTALL_DIR}")
+    if(_target_type STREQUAL "MODULE_LIBRARY")
+      get_target_property(_module_install_destination ${target}
+        EMIT_LLVMIR_INSTALL_DESTINATION)
+      if(_module_install_destination AND
+         NOT _module_install_destination STREQUAL "_module_install_destination-NOTFOUND")
+        # Preserve subdirectories within the native library directory, while
+        # keeping modules installed elsewhere (e.g. share) in the IR root.
+        # Resolve both paths against the prefix to support absolute destinations.
+        get_filename_component(_module_install_absolute
+          "${_module_install_destination}" ABSOLUTE BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+        get_filename_component(_library_install_absolute
+          "${CMAKE_INSTALL_LIBDIR}" ABSOLUTE BASE_DIR "${CMAKE_INSTALL_PREFIX}")
+        file(RELATIVE_PATH _module_install_relative
+          "${_library_install_absolute}" "${_module_install_absolute}")
+        if(_module_install_relative AND
+           NOT _module_install_relative STREQUAL "." AND
+           NOT _module_install_relative MATCHES "^\\.\\.(/|$)" AND
+           NOT IS_ABSOLUTE "${_module_install_relative}")
+          string(APPEND _llvmir_install_dir "/${_module_install_relative}")
+        endif()
+      endif()
+    endif()
   endif()
 
   # Skip installation for targets excluded from all (like disabled examples)

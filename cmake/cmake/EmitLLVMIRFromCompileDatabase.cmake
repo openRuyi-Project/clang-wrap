@@ -102,7 +102,9 @@ foreach(_argument IN LISTS _command)
     set(_skip_next TRUE)
   elseif(_argument MATCHES "^-o.+")
     # Drop the native object output; a new .bc output is appended below.
-  elseif(_argument STREQUAL "-emit-llvm" OR _argument STREQUAL "-fno-discard-value-names")
+  elseif(_argument STREQUAL "-emit-llvm" OR
+         _argument STREQUAL "-fno-discard-value-names" OR
+         _argument STREQUAL "-ffat-lto-objects")
     # Avoid duplicate LLVM-specific options.
   else()
     list(APPEND _bitcode_command "${_argument}")

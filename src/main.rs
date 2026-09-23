@@ -7,6 +7,7 @@
 //!
 //! Generate LLVM IR during compilation, use llvm-link to merge LLVM IR files during linking
 
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
@@ -102,6 +103,49 @@ mod tests {
     }
 
     #[test]
+    fn ir_generation_drops_fat_lto_objects_option() {
+        let args = vec![
+            "-O2".to_string(),
+            "-ffat-lto-objects".to_string(),
+            "-g".to_string(),
+        ];
+
+        assert_eq!(
+            args.into_iter()
+                .filter(|arg| !is_ir_incompatible_option(arg))
+                .collect::<Vec<_>>(),
+            vec!["-O2", "-g"]
+        );
+    }
+
+    #[test]
+    fn linker_argument_forms_are_normalized_before_classification() {
+        let args = [
+            "-Wl,--dynamic-list".to_string(),
+            "-Wl,/build/dynamic.list".to_string(),
+            "-Xlinker".to_string(),
+            "--version-script".to_string(),
+            "-Xlinker".to_string(),
+            "/build/exports.map".to_string(),
+            "-Wl,-rpath".to_string(),
+            "-Wl,$ORIGIN/../lib".to_string(),
+            "-Xlinker".to_string(),
+            "-rpath-link".to_string(),
+            "-Xlinker".to_string(),
+            "/build/lib".to_string(),
+        ];
+        assert_eq!(
+            normalize_linker_arguments(&args),
+            [
+                "-Wl,--dynamic-list=/build/dynamic.list",
+                "-Wl,--version-script=/build/exports.map",
+                "-Wl,-rpath,$ORIGIN/../lib",
+                "-Wl,-rpath-link,/build/lib",
+            ]
+        );
+    }
+
+    #[test]
     fn precise_usr_bin_clang_path_uses_versioned_command_name() {
         assert_eq!(
             precise_usr_bin_clang_path(
@@ -185,6 +229,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             &[],
         )
         .unwrap_err();
@@ -219,6 +264,7 @@ mod tests {
             &args,
             &[],
             false,
+            None,
             None,
             None,
             &[],
@@ -263,6 +309,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             &[],
         )
         .unwrap();
@@ -295,6 +342,7 @@ mod tests {
             &[],
             false,
             Some(Path::new("/artifact/program_verscript")),
+            None,
             None,
             &[],
         )
@@ -330,6 +378,7 @@ mod tests {
             false,
             Some(Path::new("/artifact/program_verscript")),
             None,
+            None,
             &[],
         )
         .unwrap();
@@ -337,6 +386,40 @@ mod tests {
         let script = fs::read_to_string(format!("{}_cmd", bitcode.display())).unwrap();
         assert!(script.contains("-Wl,--version-script=./program_verscript"));
         assert!(!script.contains("../src/libpcre2-8.sym"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dynamic_list_option_is_rewritten_to_installed_sidecar() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("clang-wrap-cmd-dynamic-list-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bitcode = dir.join("program.bc");
+        let args = vec![
+            "program.o".to_string(),
+            "-Wl,--dynamic-list=/private/build/dynamic.list".to_string(),
+        ];
+
+        generate_link_cmd_file(
+            Path::new("/bin/false"),
+            &bitcode,
+            Path::new("program"),
+            &args,
+            &[],
+            false,
+            None,
+            Some(Path::new("/artifact/program_dynamiclist")),
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let script = fs::read_to_string(format!("{}_cmd", bitcode.display())).unwrap();
+        assert!(script.contains("-Wl,--dynamic-list=./program_dynamiclist"));
+        assert!(!script.contains("/private/build/dynamic.list"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -357,6 +440,7 @@ mod tests {
             &["program.o".to_string(), "-l:libproject.so.0".to_string()],
             &[],
             false,
+            None,
             None,
             None,
             &[],
@@ -397,6 +481,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             &[],
         )
         .unwrap();
@@ -408,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn static_archives_are_repeatedly_linked_with_only_needed() {
+    fn static_archives_select_members_before_one_link() {
         let dir = unique_temp_dir("llvm-link-archive-selection");
         let linker = dir.join("fake-llvm-link");
         let invocation_log = dir.join("invocations");
@@ -417,9 +502,51 @@ mod tests {
         let archive_a = dir.join("liba.a");
         let archive_b = dir.join("libb.a");
         let log_file = File::create(dir.join("merge.log")).unwrap();
-        fs::write(&direct, "direct").unwrap();
-        fs::write(&archive_a, "archive a").unwrap();
-        fs::write(&archive_b, "archive b").unwrap();
+        let source_main = dir.join("main.c");
+        let source_a = dir.join("a.c");
+        let source_b = dir.join("b.c");
+        fs::write(
+            &source_main,
+            "extern int archive_a(void); int main(void) { return archive_a(); }\n",
+        )
+        .unwrap();
+        fs::write(&source_a, "int archive_a(void) { return 1; }\n").unwrap();
+        fs::write(&source_b, "int archive_b(void) { return 2; }\n").unwrap();
+        let clang = find_llvm_tool("clang", "clang");
+        let archive_a_member = dir.join("archive_a.bc");
+        for (source, bitcode) in [(&source_main, &direct), (&source_a, &archive_a_member)] {
+            assert!(Command::new(&clang)
+                .args(["-emit-llvm", "-c"])
+                .arg(source)
+                .arg("-o")
+                .arg(bitcode)
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(Command::new(find_llvm_tool("llvm-ar", "clang"))
+            .args(["rcsD"])
+            .arg(&archive_a)
+            .arg(&archive_a_member)
+            .status()
+            .unwrap()
+            .success());
+        let archive_b_member = dir.join("archive_b.bc");
+        assert!(Command::new(find_llvm_tool("clang", "clang"))
+            .args(["-emit-llvm", "-c"])
+            .arg(&source_b)
+            .arg("-o")
+            .arg(&archive_b_member)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new(find_llvm_tool("llvm-ar", "clang"))
+            .args(["rcsD"])
+            .arg(&archive_b)
+            .arg(&archive_b_member)
+            .status()
+            .unwrap()
+            .success());
         fs::write(
             &linker,
             format!(
@@ -444,13 +571,9 @@ mod tests {
 
         let invocations = fs::read_to_string(&invocation_log).unwrap();
         let lines = invocations.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 3, "{invocations}");
+        assert_eq!(lines.len(), 1, "{invocations}");
         assert!(!lines[0].contains("--only-needed"));
-        for line in &lines[1..] {
-            assert!(line.starts_with("--only-needed -o "), "{line}");
-            assert!(line.contains(archive_a.to_str().unwrap()), "{line}");
-            assert!(line.contains(archive_b.to_str().unwrap()), "{line}");
-        }
+        assert!(lines[0].contains("archive-0"), "{invocations}");
         assert!(output.exists());
         assert!(!PathBuf::from(format!("{}.direct-input", output.display())).exists());
         assert!(!PathBuf::from(format!("{}.static-archive-current", output.display())).exists());
@@ -468,8 +591,17 @@ mod tests {
         let archive = dir.join("libconvenience.a");
         let member = dir.join("convenience.bc");
         let log_file = File::create(dir.join("merge.log")).unwrap();
-        fs::write(&direct, "direct").unwrap();
-        fs::write(&member, "archive").unwrap();
+        let source = dir.join("whole.c");
+        fs::write(&source, "int convenience(void) { return 3; }\n").unwrap();
+        assert!(Command::new(find_llvm_tool("clang", "clang"))
+            .args(["-emit-llvm", "-c"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&direct)
+            .status()
+            .unwrap()
+            .success());
+        fs::copy(&direct, &member).unwrap();
         let status = Command::new(find_llvm_tool("llvm-ar", "clang"))
             .args(["rcsD"])
             .arg(&archive)
@@ -501,12 +633,9 @@ mod tests {
 
         let invocations = fs::read_to_string(&invocation_log).unwrap();
         let lines = invocations.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2, "{invocations}");
-        assert!(!lines[1].contains("--only-needed"), "{invocations}");
-        assert!(
-            lines[1].contains(archive.to_str().unwrap()),
-            "{invocations}"
-        );
+        assert_eq!(lines.len(), 1, "{invocations}");
+        assert!(!lines[0].contains("--only-needed"), "{invocations}");
+        assert!(lines[0].contains("whole-0"), "{invocations}");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -805,6 +934,85 @@ fn is_rpath_arg(arg: &str) -> bool {
         || arg.starts_with("-Wl,--rpath=")
 }
 
+/// Convert the several compiler-driver spellings of linker arguments into one
+/// representation before any link-command classification takes place.
+/// Values are deliberately folded into the same argument: this makes
+/// `-Xlinker --dynamic-list -Xlinker file`, `-Wl,--dynamic-list -Wl,file`,
+/// and `-Wl,--dynamic-list,file` equivalent.
+fn normalize_linker_arguments(args: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let (mut linker, mut consumed) = if argument == "-Xlinker" {
+            let Some(value) = args.get(index + 1) else {
+                normalized.push(argument.clone());
+                index += 1;
+                continue;
+            };
+            (value.clone(), 2)
+        } else if let Some(value) = argument.strip_prefix("-Wl,") {
+            (value.to_string(), 1)
+        } else if matches!(
+            argument.as_str(),
+            "-rpath" | "--rpath" | "-rpath-link" | "--rpath-link"
+        ) {
+            (argument.clone(), 1)
+        } else {
+            normalized.push(argument.clone());
+            index += 1;
+            continue;
+        };
+
+        let (option, embedded_value) = linker
+            .split_once([',', '='])
+            .map_or((linker.as_str(), None), |(option, value)| {
+                (option, Some(value))
+            });
+        let takes_value = matches!(
+            option,
+            "-version-script"
+                | "--version-script"
+                | "--dynamic-list"
+                | "--dependency-file"
+                | "-rpath"
+                | "--rpath"
+                | "-rpath-link"
+                | "--rpath-link"
+        );
+        let mut value = embedded_value.map(str::to_owned);
+        if takes_value && value.is_none() {
+            if let Some(next) = args.get(index + consumed) {
+                let mut next_value = next.as_str();
+                let mut extra = 1;
+                if next_value == "-Xlinker" {
+                    if let Some(payload) = args.get(index + consumed + 1) {
+                        next_value = payload;
+                        extra = 2;
+                    }
+                } else if let Some(payload) = next_value.strip_prefix("-Wl,") {
+                    next_value = payload;
+                }
+                value = Some(next_value.to_string());
+                consumed += extra;
+            }
+        }
+        if let Some(value) = value {
+            linker = if matches!(
+                option,
+                "-version-script" | "--version-script" | "--dynamic-list" | "--dependency-file"
+            ) {
+                format!("{option}={value}")
+            } else {
+                format!("{option},{value}")
+            };
+        }
+        normalized.push(format!("-Wl,{linker}"));
+        index += consumed;
+    }
+    normalized
+}
+
 fn rpath_arg_consumes_next(arg: &str) -> bool {
     matches!(arg, "-rpath" | "--rpath" | "-Wl,-rpath" | "-Wl,--rpath")
 }
@@ -865,6 +1073,10 @@ fn is_compiler_only_option(arg: &str) -> bool {
         || arg.starts_with("-fdebug-prefix-map=")
         || arg.starts_with("-ffile-prefix-map=")
         || arg.starts_with("-fmacro-prefix-map=")
+}
+
+fn is_ir_incompatible_option(arg: &str) -> bool {
+    arg == "-ffat-lto-objects"
 }
 
 /// Return whether an argument is a linker option whose value makes a generated
@@ -1170,6 +1382,157 @@ fn filtered_whole_archives(
     Ok((filtered, temporary_archives))
 }
 
+#[derive(Default)]
+struct BitcodeSymbols {
+    defined: HashSet<String>,
+    undefined: HashSet<String>,
+}
+
+struct ArchiveMember {
+    path: PathBuf,
+    symbols: BitcodeSymbols,
+}
+
+fn read_bitcode_symbols(nm: &Path, input: &Path) -> std::io::Result<BitcodeSymbols> {
+    let output = Command::new(nm)
+        .args(["--extern-only", "--format=posix"])
+        .arg(input)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "{} failed to inspect {}",
+            nm.display(),
+            input.display()
+        )));
+    }
+
+    let mut symbols = BitcodeSymbols::default();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        let Some(kind) = fields.next() else { continue };
+        if kind.eq_ignore_ascii_case("U") {
+            symbols.undefined.insert(name.to_string());
+        } else {
+            symbols.defined.insert(name.to_string());
+        }
+    }
+    Ok(symbols)
+}
+
+fn extract_archive_members(
+    llvm_ar: &Path,
+    nm: &Path,
+    archive: &Path,
+    directory: &Path,
+) -> std::io::Result<Vec<ArchiveMember>> {
+    fs::create_dir_all(directory)?;
+    let listed = Command::new(llvm_ar).arg("t").arg(archive).output()?;
+    if !listed.status.success() {
+        return Err(std::io::Error::other(format!(
+            "{} failed to list {}",
+            llvm_ar.display(),
+            archive.display()
+        )));
+    }
+
+    let mut members = Vec::new();
+    for (index, name) in String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter(|name| !name.is_empty())
+        .enumerate()
+    {
+        let path = directory.join(format!("{index}-{}", Path::new(name).display()));
+        let extracted = Command::new(llvm_ar)
+            .arg("p")
+            .arg(archive)
+            .arg(name)
+            .output()?;
+        if !extracted.status.success() {
+            return Err(std::io::Error::other(format!(
+                "{} failed to extract {} from {}",
+                llvm_ar.display(),
+                name,
+                archive.display()
+            )));
+        }
+        fs::write(&path, extracted.stdout)?;
+        members.push(ArchiveMember {
+            symbols: read_bitcode_symbols(nm, &path)?,
+            path,
+        });
+    }
+    Ok(members)
+}
+
+fn add_module_symbols(symbols: &mut BitcodeSymbols, module: BitcodeSymbols) {
+    for name in module.defined {
+        symbols.undefined.remove(&name);
+        symbols.defined.insert(name);
+    }
+    for name in module.undefined {
+        if !symbols.defined.contains(&name) {
+            symbols.undefined.insert(name);
+        }
+    }
+}
+
+/// Select archive members using native-linker-like unresolved-symbol state.
+/// Archives may be rescanned for dependency closure, but a selected member is
+/// emitted only once. This prevents repeated llvm-link passes from duplicating
+/// C++ global constructors while preserving cross-archive dependencies.
+fn select_archive_members(
+    llvm_ar: &Path,
+    nm: &Path,
+    archives: &[PathBuf],
+    direct_inputs: &[PathBuf],
+    work_directory: &Path,
+) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut symbols = BitcodeSymbols::default();
+    for input in direct_inputs {
+        add_module_symbols(&mut symbols, read_bitcode_symbols(nm, input)?);
+    }
+
+    let mut archive_members = Vec::new();
+    let mut extracted_directories = Vec::new();
+    for (index, archive) in archives.iter().enumerate() {
+        let directory = work_directory.join(format!("archive-{index}"));
+        archive_members.push(extract_archive_members(llvm_ar, nm, archive, &directory)?);
+        extracted_directories.push(directory);
+    }
+
+    let mut selected = HashSet::new();
+    let mut selected_paths = Vec::new();
+    loop {
+        let mut changed = false;
+        for members in &archive_members {
+            for member in members {
+                let member_id = member.path.clone();
+                if selected.contains(&member_id)
+                    || member.symbols.defined.is_disjoint(&symbols.undefined)
+                {
+                    continue;
+                }
+                selected.insert(member_id.clone());
+                selected_paths.push(member_id);
+                add_module_symbols(
+                    &mut symbols,
+                    BitcodeSymbols {
+                        defined: member.symbols.defined.clone(),
+                        undefined: member.symbols.undefined.clone(),
+                    },
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    Ok((selected_paths, extracted_directories))
+}
+
 /// Merge direct bitcode and LLVM static archives with ELF-like archive member
 /// selection. llvm-link only performs one left-to-right archive scan, so repeat
 /// it once per archive to resolve dependencies introduced by later archives.
@@ -1185,9 +1548,6 @@ fn merge_llvm_ir(
         return run_llvm_link(llvm_link, output, direct_inputs, false, log_file);
     }
 
-    let seed = PathBuf::from(format!("{}.direct-input", output.display()));
-    let current = PathBuf::from(format!("{}.static-archive-current", output.display()));
-    let next = PathBuf::from(format!("{}.static-archive-next", output.display()));
     let llvm_ar = find_llvm_tool(
         "llvm-ar",
         llvm_link
@@ -1197,10 +1557,9 @@ fn merge_llvm_ir(
     );
     let (whole_archives, temporary_archives) =
         filtered_whole_archives(&llvm_ar, output, direct_inputs, whole_archives)?;
+    let work_directory = PathBuf::from(format!("{}.archive-members", output.display()));
     let cleanup = || {
-        let _ = fs::remove_file(&seed);
-        let _ = fs::remove_file(&current);
-        let _ = fs::remove_file(&next);
+        let _ = fs::remove_dir_all(&work_directory);
         for archive in &temporary_archives {
             let _ = fs::remove_file(archive);
         }
@@ -1211,33 +1570,36 @@ fn merge_llvm_ir(
         // A link target normally has direct object/source input. If it does
         // not, retain llvm-link's old behavior rather than manufacturing an
         // empty seed that could change shared-library semantics.
-        if direct_inputs.is_empty() {
-            let mut inputs = static_archives.to_vec();
-            inputs.extend_from_slice(&whole_archives);
-            return run_llvm_link(llvm_link, output, &inputs, false, log_file);
-        }
-        run_llvm_link(llvm_link, &seed, direct_inputs, false, log_file)?;
-        fs::rename(&seed, &current)?;
-        for _ in 0..static_archives.len() {
-            let mut inputs = Vec::with_capacity(static_archives.len() + 1);
-            inputs.push(current.clone());
-            inputs.extend_from_slice(static_archives);
-            run_llvm_link(llvm_link, &next, &inputs, true, log_file)?;
-            fs::rename(&next, &current)?;
-        }
-        // GNU ld's --whole-archive means every member is included regardless
-        // of unresolved references.  llvm-link's --only-needed intentionally
-        // has the opposite behaviour for archives, so merge these archives
-        // without it. This is essential for libtool convenience archives such
-        // as GSL's, whose public functions are not referenced by version.o.
+        let nm = find_llvm_tool(
+            "llvm-nm",
+            llvm_link
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("llvm-link"),
+        );
+        let (selected_members, _) = select_archive_members(
+            &llvm_ar,
+            &nm,
+            static_archives,
+            direct_inputs,
+            &work_directory,
+        )?;
+        let mut inputs = direct_inputs.to_vec();
+        inputs.extend(selected_members);
         if !whole_archives.is_empty() {
-            let mut inputs = Vec::with_capacity(whole_archives.len() + 1);
-            inputs.push(current.clone());
-            inputs.extend_from_slice(&whole_archives);
-            run_llvm_link(llvm_link, &next, &inputs, false, log_file)?;
-            fs::rename(&next, &current)?;
+            let mut whole_members = Vec::new();
+            for (index, archive) in whole_archives.iter().enumerate() {
+                let members = extract_archive_members(
+                    &llvm_ar,
+                    &nm,
+                    archive,
+                    &work_directory.join(format!("whole-{index}")),
+                )?;
+                whole_members.extend(members.into_iter().map(|member| member.path));
+            }
+            inputs.extend(whole_members);
         }
-        fs::rename(&current, output)?;
+        run_llvm_link(llvm_link, output, &inputs, false, log_file)?;
         Ok(())
     })();
     cleanup();
@@ -1262,6 +1624,7 @@ fn handle_link_command(
     let mut library_dirs: Vec<String> = Vec::new();
     let mut is_shared = false;
     let mut version_script: Option<PathBuf> = None;
+    let mut dynamic_list: Option<PathBuf> = None;
     let mut soversion: Option<String> = None;
     let mut whole_archive_active = false;
     let mut i = 1;
@@ -1349,6 +1712,9 @@ fn handle_link_command(
 
             if let Some(path) = normalized_arg.strip_prefix("-Wl,--version-script=") {
                 version_script = Some(PathBuf::from(path));
+            }
+            if let Some(path) = normalized_arg.strip_prefix("-Wl,--dynamic-list=") {
+                dynamic_list = Some(PathBuf::from(path));
             }
 
             if let Some(soname) = normalized_arg.strip_prefix("-Wl,-soname,") {
@@ -1660,6 +2026,39 @@ fn handle_link_command(
                 None
             };
 
+            let dynamic_list_dest = if let Some(ref list_path) = dynamic_list {
+                let output_name = output_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("output");
+                let list_filename = format!("{}_dynamiclist", output_name);
+                let list_dest = llvm_link_output
+                    .parent()
+                    .map(|p| p.join(&list_filename))
+                    .unwrap_or_else(|| PathBuf::from(&list_filename));
+                if list_path.exists() {
+                    if let Err(e) = fs::copy(list_path, &list_dest) {
+                        eprintln!("Warning: Failed to copy dynamic list: {}", e);
+                        None
+                    } else {
+                        debug_log(
+                            debug_mode,
+                            &format!(
+                                "[DEBUG] Copied dynamic list: {} -> {}",
+                                list_path.display(),
+                                list_dest.display()
+                            ),
+                        );
+                        Some(list_dest)
+                    }
+                } else {
+                    eprintln!("Warning: Dynamic list not found: {}", list_path.display());
+                    None
+                }
+            } else {
+                None
+            };
+
             if let Err(e) = generate_link_cmd_file(
                 clang_path,
                 &llvm_link_output,
@@ -1668,6 +2067,7 @@ fn handle_link_command(
                 &library_dirs,
                 is_shared,
                 version_script_dest.as_deref(),
+                dynamic_list_dest.as_deref(),
                 soversion.as_deref(),
                 &missing_ir_files,
             ) {
@@ -1706,10 +2106,12 @@ fn generate_link_cmd_file(
     library_dirs: &[String],
     is_shared: bool,
     version_script_dest: Option<&Path>,
+    dynamic_list_dest: Option<&Path>,
     soversion: Option<&str>,
     missing_ir_files: &[PathBuf],
 ) -> Result<(), std::io::Error> {
     let cmd_path = format!("{}_cmd", llvm_link_output.display());
+    let normalized_args = normalize_linker_arguments(original_args);
 
     let bc_filename = llvm_link_output
         .file_name()
@@ -1763,7 +2165,7 @@ fn generate_link_cmd_file(
     // A non-relocatable linker path means no valid distributable `_cmd` can be
     // produced. Fail the current link instead of emitting an intentionally
     // broken command that would let the original build/install succeed.
-    if has_nonportable_linker_path_option(original_args) {
+    if has_nonportable_linker_path_option(&normalized_args) {
         let _ = fs::remove_file(&cmd_path);
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1787,7 +2189,7 @@ fn generate_link_cmd_file(
     // -l:SONAME arguments.
     push_array_arg(&mut script, "-L..");
 
-    let has_optimization_level = original_args
+    let has_optimization_level = normalized_args
         .iter()
         .any(|arg| is_optimization_level_arg(arg));
     if !has_optimization_level {
@@ -1797,9 +2199,9 @@ fn generate_link_cmd_file(
     let mut emitted_bitcode = false;
     let mut visited_linker_scripts = Vec::new();
     let mut index = 0;
-    while index < original_args.len() {
-        let arg = &original_args[index];
-        let next = original_args.get(index + 1);
+    while index < normalized_args.len() {
+        let arg = &normalized_args[index];
+        let next = normalized_args.get(index + 1);
         if arg == "-o" {
             index += 2;
             continue;
@@ -1851,7 +2253,7 @@ fn generate_link_cmd_file(
             ) {
                 // The value of the two-token option may be forwarded through
                 // a second -Xlinker.
-                index += if original_args
+                if normalized_args
                     .get(index + 2)
                     .is_some_and(|arg| arg == "-Xlinker")
                 {
@@ -1934,12 +2336,25 @@ fn generate_link_cmd_file(
             index += 1;
             continue;
         }
-        if arg.starts_with("-Wl,--version-script=") || arg.starts_with("-Wl,-version-script,") {
+        if arg.starts_with("-Wl,--version-script=")
+            || arg.starts_with("-Wl,-version-script,")
+            || arg.starts_with("-Wl,-version-script=")
+        {
             if let Some(path) = version_script_dest
                 .and_then(|path| path.file_name())
                 .and_then(|name| name.to_str())
             {
                 push_array_arg(&mut script, &format!("-Wl,--version-script=./{path}"));
+            }
+            index += 1;
+            continue;
+        }
+        if arg.starts_with("-Wl,--dynamic-list=") || arg.starts_with("-Wl,--dynamic-list,") {
+            if let Some(path) = dynamic_list_dest
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+            {
+                push_array_arg(&mut script, &format!("-Wl,--dynamic-list=./{path}"));
             }
             index += 1;
             continue;
@@ -2157,6 +2572,11 @@ fn main() {
 
     while i < args.len() {
         let arg = &args[i];
+
+        if is_ir_incompatible_option(arg) {
+            i += 1;
+            continue;
+        }
 
         if arg == "-o" {
             if i + 1 < args.len() {

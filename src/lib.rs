@@ -281,6 +281,7 @@ pub enum AuxFileSuffix {
     Log,
     Cmd,
     Verscript,
+    DynamicList,
     Missing,
 }
 
@@ -290,6 +291,7 @@ impl AuxFileSuffix {
             AuxFileSuffix::Log => "_log",
             AuxFileSuffix::Cmd => "_cmd",
             AuxFileSuffix::Verscript => "_verscript",
+            AuxFileSuffix::DynamicList => "_dynamiclist",
             AuxFileSuffix::Missing => "_missing",
         }
     }
@@ -326,6 +328,7 @@ pub fn find_all_aux_files(file_path: &Path) -> Vec<(AuxFileSuffix, PathBuf)> {
         AuxFileSuffix::Log,
         AuxFileSuffix::Cmd,
         AuxFileSuffix::Verscript,
+        AuxFileSuffix::DynamicList,
         AuxFileSuffix::Missing,
     ]
     .iter()

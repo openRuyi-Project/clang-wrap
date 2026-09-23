@@ -56,7 +56,8 @@ test_pcre2() {
 	(
 		cd testdeb/pcre2
 		rm -rf pcre2*
-		apt-get source pcre2
+		#apt-get source pcre2
+		dget -x -u http://mirrors.bfsu.edu.cn/debian/pool/main/p/pcre2/pcre2_10.47-2.dsc
 		cd pcre2-*
 		mkdir -p build-with-clangwrap && cd build-with-clangwrap
 		rm -rf ~/tmp/llvmir/`pwd`

@@ -185,11 +185,8 @@ test_link_scripts() {
         done
     }
     
-    # 查找所有 llvmir 目录（包括 llvmir, llvmir-bin 等）
-    for llvmir_dir in "$install_dir/lib/llvmir-bin" "$install_dir/lib/llvmir"; do
-        if [ ! -d "$llvmir_dir" ]; then
-            continue
-        fi
+    # 查找所有 LLVM IR 目录（包括插件的嵌套目录和 llvmir-bin 等）。
+    while IFS= read -r llvmir_dir; do
         
         cd "$llvmir_dir"
         if ls *_cmd 1> /dev/null 2>&1; then
@@ -261,7 +258,7 @@ test_link_scripts() {
 		set -e
             done
         fi
-    done
+    done < <(find "$install_dir/lib" -type d -name 'llvmir*' -print | sort)
     
     if [ $total_skipped -gt 0 ]; then
         print_info "链接脚本结果：$total_success 成功，$total_fail 失败，$total_skipped 跳过"
@@ -270,13 +267,13 @@ test_link_scripts() {
     fi
     
     # 显示 output 目录内容
-    for llvmir_dir in "$install_dir/lib/llvmir" "$install_dir/lib/llvmir-bin"; do
+    while IFS= read -r llvmir_dir; do
         if [ -d "$llvmir_dir/output" ]; then
             print_info "$llvmir_dir/output 内容:"
             ls -la "$llvmir_dir/output/" 2>/dev/null | head -5
             file "$llvmir_dir/output/"* 2>/dev/null | head -5
         fi
-    done
+    done < <(find "$install_dir/lib" -type d -name 'llvmir*' -print | sort)
     
     if [ $total_fail -eq 0 ]; then
         print_success "链接脚本验证通过"
@@ -1871,8 +1868,8 @@ test_highway_static() {
 
     print_info "配置项目（静态库）..."
     CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
-        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
-        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-21 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-21 \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
         -DCMAKE_INSTALL_PREFIX="$install_dir" \
@@ -1891,18 +1888,27 @@ test_highway_static() {
     print_info "安装项目..."
     cmake --install . --prefix "$install_dir"
 
-    print_info "验证位码文件..."
-    if ls "$install_dir/lib/llvmir/"*.bc 1> /dev/null 2>&1; then
-        ls -lh "$install_dir/lib/llvmir/"*.bc | head -5
-        llvm-dis-22 "$install_dir/lib/llvmir/"*.bc -o - 2>/dev/null | head -10
-        print_success "位码文件验证通过"
+    print_info "验证静态库 LLVM archive..."
+    verify_llvm_archives "$install_dir/lib/llvmir/"*.a
 
-        # 测试所有链接脚本
-        test_link_scripts "$install_dir"
-    else
-        print_error "未找到位码文件"
-        return 1
+    # 静态库的 bitcode 保存在 archive 成员中，不会生成顶层 *.bc 文件。
+    # 某些静态库项目还会安装可执行程序，此时其 *_cmd 也必须验证。
+    local executable_cmds=()
+    if [ -d "$install_dir/lib/llvmir-bin" ]; then
+        mapfile -t executable_cmds < <(
+            find "$install_dir/lib/llvmir-bin" -maxdepth 1 -type f -name '*_cmd' -print | sort
+        )
     fi
+    if [ "${#executable_cmds[@]}" -gt 0 ]; then
+        print_info "找到 ${#executable_cmds[@]} 个可执行文件链接脚本"
+        printf '%s\n' "${executable_cmds[@]}" | head -5
+    else
+        print_info "未安装可执行文件链接脚本，跳过可执行文件 cmd 验证"
+    fi
+
+    # 同时验证库和可执行文件的所有已安装链接脚本；该函数会扫描
+    # lib/llvmir、lib/llvmir-bin 以及其他 llvmir* 子目录。
+    test_link_scripts "$install_dir"
 
     print_success "highway-static 测试通过"
 }
@@ -1927,8 +1933,8 @@ test_highway_shared() {
 
     print_info "配置项目（动态库）..."
     CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
-        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
-        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-21 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-21 \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
         -DCMAKE_INSTALL_PREFIX="$install_dir" \
@@ -1950,7 +1956,7 @@ test_highway_shared() {
     print_info "验证位码文件..."
     if ls "$install_dir/lib/llvmir/"*.bc 1> /dev/null 2>&1; then
         ls -lh "$install_dir/lib/llvmir/"*.bc | head -5
-        llvm-dis-22 "$install_dir/lib/llvmir/"*.bc -o - 2>/dev/null | head -10
+        llvm-dis-21 "$install_dir/lib/llvmir/"*.bc -o - 2>/dev/null | head -10
         print_success "位码文件验证通过"
 
         # 测试所有链接脚本
@@ -2469,6 +2475,75 @@ test_libzstd() {
     print_success "$project_name 测试通过"
 }
 
+# 测试 MariaDB 项目（CMake）
+test_mariadb() {
+    local project_name="mariadb"
+    local project_dir="$(prepare_source "$project_name" "$project_name")"
+    local build_dir="${BUILD_BASE_DIR}/${project_name}"
+    local install_dir="${INSTALL_BASE_DIR}/${project_name}"
+
+    print_header "测试 MariaDB (CMake)"
+
+    if [ ! -f "$project_dir/CMakeLists.txt" ]; then
+        print_error "项目目录不存在：$project_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir" "$install_dir"
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+
+    print_info "配置项目..."
+    # Keep WSREP enabled so MariaDB leaves its exclusion-pattern variables
+    # empty; the install() wrapper must preserve those empty PATTERN values.
+    CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
+        -DCMAKE_C_COMPILER=/home/syq/develop/llvm-project/build-rel/bin/clang \
+        -DCMAKE_CXX_COMPILER=/home/syq/develop/llvm-project/build-rel/bin/clang++ \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DWITH_UNIT_TESTS=OFF \
+        -DWITH_EMBEDDED_SERVER=ON \
+        -DDISABLE_SHARED=OFF \
+        -DWITH_WSREP=ON \
+        -DWITH_PIC=ON \
+	-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DGSSAPI_FLAVOR:STRING=MIT \
+        "-DGSSAPI_LIBS:STRING=-L/usr/lib/x86_64-linux-gnu/mit-krb5 -Wl,--enable-new-dtags -Wl,-rpath -Wl,/usr/lib/x86_64-linux-gnu/mit-krb5 -lgssapi_krb5 -lkrb5 -lk5crypto -lcom_err" \
+        -DPLUGIN_ROCKSDB=NO \
+        -DPLUGIN_MROONGA=NO \
+        -DPLUGIN_TOKUDB=NO \
+        "$project_dir"
+
+    print_info "构建项目..."
+    cmake --build . -j$(nproc) -v
+
+    print_info "安装项目..."
+    cmake --install . --prefix "$install_dir"
+
+    print_info "验证 MariaDB 动态库及位码文件..."
+    local embedded_library
+    embedded_library="$(find "$install_dir/lib" -maxdepth 1 -type f -name 'libmariadbd.so.*' -print -quit)"
+    if [ -z "$embedded_library" ]; then
+        print_error "未找到 embedded server 动态库：$install_dir/lib/libmariadbd.so.*"
+        return 1
+    fi
+    local embedded_soname
+    embedded_soname="$(basename "$embedded_library")"
+    local embedded_bc="$install_dir/lib/llvmir/${embedded_soname}.bc"
+    local embedded_cmd="$install_dir/lib/llvmir/${embedded_soname}_cmd"
+    if [ ! -f "$embedded_bc" ] || [ ! -f "$embedded_cmd" ]; then
+        print_error "未找到 embedded server LLVM IR 或链接脚本：${embedded_soname}.bc / ${embedded_soname}_cmd"
+        return 1
+    fi
+    find "$install_dir/lib/llvmir" -maxdepth 1 -type f \
+        \( -name "${embedded_soname}.bc" -o -name "${embedded_soname}_cmd" \) -print
+    print_success "MariaDB embedded server 动态库和 LLVM IR 文件验证通过：$embedded_soname"
+
+    print_info "验证 MariaDB LLVM IR 链接脚本..."
+    test_link_scripts "$install_dir"
+}
+
 # 显示帮助信息
 show_help() {
     echo "CMakeEmitLLVMIR 项目测试脚本"
@@ -2506,6 +2581,7 @@ show_help() {
     echo "  json-c         - JSON 解析库"
     echo "  libogg         - 测试 libogg 动态库和静态库"
     echo "  libzstd        - Zstandard 压缩库"
+    echo "  mariadb        - MariaDB（CMake，含 embedded server 动态库）"
     echo ""
     echo "注意：leveldb、spdlog、googletest、cpuinfo、glfw、yaml-cpp、libxml2, armadillo、libwebp 和 highway 支持静态库和动态库分别测试"
     echo "  leveldb-static   - 测试 leveldb 静态库"
@@ -2568,6 +2644,7 @@ main() {
         test_rapidjson || print_error "rapidjson 失败"
         test_armadillo_shared || print_error "armadillo-shared 失败"
         test_armadillo_static || print_error "armadillo-static 失败"
+        #test_mariadb || print_error "mariadb 失败"
 
         test_libwebp_shared || print_error "libwebp-shared 失败"
         test_libwebp_static || print_error "libwebp-static 失败"
@@ -2753,6 +2830,9 @@ main() {
                     ;;
                 libzstd)
                     test_libzstd
+                    ;;
+                mariadb)
+                    test_mariadb
                     ;;
                 *)
                     print_error "未知项目：$project"

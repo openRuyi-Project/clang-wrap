@@ -107,6 +107,8 @@ set_target_properties(external_archive_shared PROPERTIES VERSION 1.0.0 SOVERSION
 add_executable(debug_postfix_app debug_postfix.c)
 set_target_properties(debug_postfix_app PROPERTIES DEBUG_POSTFIX _dbg)
 
+add_executable(fallback_app debug_postfix.c)
+
 add_executable(nested_bin_app debug_postfix.c)
 add_executable(sbin_app debug_postfix.c)
 add_executable(libexec_app debug_postfix.c)
@@ -140,8 +142,16 @@ install(TARGETS selected_app object_app object_variant_one_app object_variant_tw
   RUNTIME DESTINATION bin
   ARCHIVE DESTINATION lib
 )
+install(TARGETS fallback_app DESTINATION bin)
 install(TARGETS nested_bin_app RUNTIME DESTINATION lib/asoftware/bin)
 install(TARGETS sbin_app RUNTIME DESTINATION sbin)
 install(TARGETS libexec_app RUNTIME DESTINATION libexec)
+
+foreach(_module_layout IN ITEMS share lib lib/plugin lib/plugin/nested)
+  string(REPLACE "/" "_" _module_id "${_module_layout}")
+  add_library(module_${_module_id} MODULE versioned.c)
+  set_target_properties(module_${_module_id} PROPERTIES PREFIX "")
+  install(TARGETS module_${_module_id} LIBRARY DESTINATION "${_module_layout}")
+endforeach()
 
 add_subdirectory(nested)

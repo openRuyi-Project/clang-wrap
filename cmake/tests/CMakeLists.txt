@@ -87,6 +87,13 @@ add_test(
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run-negative-case.cmake
 )
 add_test(
+  NAME cmake-emit-llvmir-compile-db-option-filter
+  COMMAND ${CMAKE_COMMAND}
+    -DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/EmitLLVMIRFromCompileDatabase.cmake
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-db-option-filter
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-compile-db-option-filter.cmake
+)
+add_test(
   NAME cmake-emit-llvmir-ninja-link-ambiguity-rejected
   COMMAND ${CMAKE_COMMAND}
     -DCASE_NAME=ninja-link-ambiguous

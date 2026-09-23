@@ -2,6 +2,18 @@ if(NOT DEFINED LLVM_LINK OR NOT DEFINED OUTPUT)
   message(FATAL_ERROR "LLVM_LINK and OUTPUT are required.")
 endif()
 
+if(NOT DEFINED LLVM_NM OR LLVM_NM STREQUAL "")
+  get_filename_component(_llvm_bin_dir "${LLVM_LINK}" DIRECTORY)
+  find_program(LLVM_NM NAMES llvm-nm llvm-nm-23 HINTS "${_llvm_bin_dir}" NO_DEFAULT_PATH)
+endif()
+if(NOT DEFINED LLVM_AR OR LLVM_AR STREQUAL "")
+  get_filename_component(_llvm_bin_dir "${LLVM_LINK}" DIRECTORY)
+  find_program(LLVM_AR NAMES llvm-ar llvm-ar-23 HINTS "${_llvm_bin_dir}" NO_DEFAULT_PATH)
+endif()
+if(NOT LLVM_NM OR NOT LLVM_AR)
+  message(FATAL_ERROR "Could not locate llvm-nm and llvm-ar next to LLVM_LINK.")
+endif()
+
 string(REPLACE "," ";" _direct_bc_files "${DIRECT_BC_FILES}")
 string(REPLACE "," ";" _static_bc_files "${STATIC_BC_FILES}")
 string(REPLACE "," ";" _whole_archive_bc_files "${WHOLE_ARCHIVE_BC_FILES}")
@@ -11,46 +23,139 @@ endif()
 
 get_filename_component(_output_dir "${OUTPUT}" DIRECTORY)
 file(MAKE_DIRECTORY "${_output_dir}")
-set(_seed "${OUTPUT}.whole-archive-input.bc")
-set(_current "${OUTPUT}.static-archive-current.bc")
-set(_next "${OUTPUT}.static-archive-next.bc")
-file(REMOVE "${_seed}" "${_current}" "${_next}")
+set(_member_dir "${OUTPUT}.archive-members")
+file(REMOVE_RECURSE "${_member_dir}")
+file(MAKE_DIRECTORY "${_member_dir}")
 
-# Whole-archive inputs are flattened member bitcode because the native linker
-# is explicitly forced to load every member there. Merge those with direct
-# inputs first, then let llvm-link apply archive member selection to ordinary
-# static-library LLVM archives.
+function(_read_symbols input defined_var undefined_var)
+  execute_process(
+    COMMAND "${LLVM_NM}" --defined-only --extern-only --format=posix "${input}"
+    RESULT_VARIABLE _nm_result
+    OUTPUT_VARIABLE _defined_output
+    ERROR_VARIABLE _nm_error
+  )
+  if(NOT _nm_result EQUAL 0)
+    message(FATAL_ERROR "LLVM symbol inspection failed for ${input}: ${_nm_error}")
+  endif()
+  execute_process(
+    COMMAND "${LLVM_NM}" --undefined-only --extern-only --format=posix "${input}"
+    RESULT_VARIABLE _nm_result
+    OUTPUT_VARIABLE _undefined_output
+    ERROR_VARIABLE _nm_error
+  )
+  if(NOT _nm_result EQUAL 0)
+    message(FATAL_ERROR "LLVM undefined-symbol inspection failed for ${input}: ${_nm_error}")
+  endif()
+  set(_defined "")
+  set(_undefined "")
+  string(REPLACE "\n" ";" _lines "${_defined_output}")
+  foreach(_line IN LISTS _lines)
+    if(_line MATCHES "^([^; \t]+)[ \t]+([^; \t]+)")
+      list(APPEND _defined "${CMAKE_MATCH_1}")
+    endif()
+  endforeach()
+  string(REPLACE "\n" ";" _lines "${_undefined_output}")
+  foreach(_line IN LISTS _lines)
+    if(_line MATCHES "^([^; \t]+)[ \t]+([^; \t]+)")
+      list(APPEND _undefined "${CMAKE_MATCH_1}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES _defined)
+  list(REMOVE_DUPLICATES _undefined)
+  set(${defined_var} "${_defined}" PARENT_SCOPE)
+  set(${undefined_var} "${_undefined}" PARENT_SCOPE)
+endfunction()
+
+function(_add_symbols input defined_var undefined_var)
+  _read_symbols("${input}" _module_defined _module_undefined)
+  set(_defined "${${defined_var}}")
+  set(_undefined "${${undefined_var}}")
+  foreach(_symbol IN LISTS _module_defined)
+    list(REMOVE_ITEM _undefined "${_symbol}")
+    list(APPEND _defined "${_symbol}")
+  endforeach()
+  foreach(_symbol IN LISTS _module_undefined)
+    if(NOT _symbol IN_LIST _defined)
+      list(APPEND _undefined "${_symbol}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES _defined)
+  list(REMOVE_DUPLICATES _undefined)
+  set(${defined_var} "${_defined}" PARENT_SCOPE)
+  set(${undefined_var} "${_undefined}" PARENT_SCOPE)
+endfunction()
+
+function(_extract_archive archive directory members_var)
+  file(MAKE_DIRECTORY "${directory}")
+  execute_process(
+    COMMAND "${LLVM_AR}" x "${archive}"
+    WORKING_DIRECTORY "${directory}"
+    RESULT_VARIABLE _extract_result
+    ERROR_VARIABLE _extract_error
+  )
+  if(NOT _extract_result EQUAL 0)
+    message(FATAL_ERROR "LLVM archive extraction failed for ${archive}: ${_extract_error}")
+  endif()
+  file(GLOB _members LIST_DIRECTORIES false "${directory}/*")
+  set(${members_var} "${_members}" PARENT_SCOPE)
+endfunction()
+
+set(_defined_symbols "")
+set(_undefined_symbols "")
+foreach(_input IN LISTS _direct_bc_files)
+  _add_symbols("${_input}" _defined_symbols _undefined_symbols)
+endforeach()
+
+set(_members "")
+set(_member_index 0)
+foreach(_archive IN LISTS _static_bc_files)
+  _extract_archive("${_archive}" "${_member_dir}/archive-${_member_index}" _archive_members)
+  list(APPEND _members ${_archive_members})
+  math(EXPR _member_index "${_member_index} + 1")
+endforeach()
+
+set(_selected_members "")
+set(_changed TRUE)
+while(_changed)
+  set(_changed FALSE)
+  foreach(_member IN LISTS _members)
+    if(_member IN_LIST _selected_members)
+      continue()
+    endif()
+    _read_symbols("${_member}" _member_defined _member_undefined)
+    set(_provides_unresolved FALSE)
+    foreach(_symbol IN LISTS _member_defined)
+      if(_symbol IN_LIST _undefined_symbols)
+        set(_provides_unresolved TRUE)
+      endif()
+    endforeach()
+    if(_provides_unresolved)
+      _add_symbols("${_member}" _defined_symbols _undefined_symbols)
+      list(APPEND _selected_members "${_member}")
+      set(_changed TRUE)
+    endif()
+  endforeach()
+endwhile()
+
+set(_whole_members "")
+set(_whole_index 0)
+foreach(_archive IN LISTS _whole_archive_bc_files)
+  if(_archive MATCHES "\\.a$")
+    _extract_archive("${_archive}" "${_member_dir}/whole-${_whole_index}" _archive_members)
+    list(APPEND _whole_members ${_archive_members})
+  else()
+    list(APPEND _whole_members "${_archive}")
+  endif()
+  math(EXPR _whole_index "${_whole_index} + 1")
+endforeach()
+
 execute_process(
-  COMMAND "${LLVM_LINK}" ${_direct_bc_files} ${_whole_archive_bc_files} -o "${_seed}"
+  COMMAND "${LLVM_LINK}" ${_direct_bc_files} ${_selected_members} ${_whole_members} -o "${OUTPUT}"
   RESULT_VARIABLE _result
   OUTPUT_VARIABLE _output
   ERROR_VARIABLE _error
 )
 if(NOT _result EQUAL 0)
-  message(FATAL_ERROR "LLVM direct bitcode merge failed:\n${_output}\n${_error}")
+  message(FATAL_ERROR "LLVM bitcode merge failed:\n${_output}\n${_error}")
 endif()
-
-# llvm-link scans archives in argument order. A member selected from a later
-# archive can introduce a reference satisfied by an earlier archive, so repeat
-# the archive scan once per archive to reach the native linker's dependency
-# closure while keeping archive member selection semantics.
-if(_static_bc_files)
-  list(LENGTH _static_bc_files _static_archive_count)
-  file(RENAME "${_seed}" "${_current}")
-  foreach(_pass RANGE 1 ${_static_archive_count})
-    execute_process(
-      COMMAND "${LLVM_LINK}" --only-needed "${_current}" ${_static_bc_files} -o "${_next}"
-      RESULT_VARIABLE _result
-      OUTPUT_VARIABLE _output
-      ERROR_VARIABLE _error
-    )
-    if(NOT _result EQUAL 0)
-      message(FATAL_ERROR "LLVM static dependency bitcode merge failed:\n${_output}\n${_error}")
-    endif()
-    file(RENAME "${_next}" "${_current}")
-  endforeach()
-  file(COPY_FILE "${_current}" "${OUTPUT}" ONLY_IF_DIFFERENT)
-else()
-  file(RENAME "${_seed}" "${OUTPUT}")
-endif()
-file(REMOVE "${_seed}" "${_current}" "${_next}")
+file(REMOVE_RECURSE "${_member_dir}")

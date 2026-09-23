@@ -108,6 +108,8 @@ if(CASE_MODE STREQUAL "ON")
   endif()
   if(NOT EXISTS "${_install_prefix}/lib/llvmir-bin/selected_app.bc" OR
      NOT EXISTS "${_install_prefix}/lib/llvmir-bin/selected_app_cmd" OR
+     NOT EXISTS "${_install_prefix}/lib/llvmir-bin/fallback_app.bc" OR
+     NOT EXISTS "${_install_prefix}/lib/llvmir-bin/fallback_app_cmd" OR
      NOT EXISTS "${_install_prefix}/lib/llvmir-bin/object_app_cmd" OR
      NOT EXISTS "${_install_prefix}/lib/llvmir-bin/object_variant_one_app.bc" OR
      NOT EXISTS "${_install_prefix}/lib/llvmir-bin/object_variant_two_app.bc" OR
@@ -135,6 +137,28 @@ if(CASE_MODE STREQUAL "ON")
     message(FATAL_ERROR "LLVM IR component installation omitted expected artifacts.")
   endif()
   file(READ "${_install_prefix}/lib/llvmir/libasm_shared.so.1_cmd" _asm_shared_script)
+  foreach(_module_layout IN ITEMS share lib lib/plugin lib/plugin/nested)
+    string(REPLACE "/" "_" _module_id "${_module_layout}")
+    string(REGEX REPLACE "^lib/?|^share$" "" _module_subdir "${_module_layout}")
+    set(_module_ir_dir "${_install_prefix}/lib/llvmir/${_module_subdir}")
+    if(NOT EXISTS "${_install_prefix}/${_module_layout}/module_${_module_id}.so" OR
+       NOT EXISTS "${_module_ir_dir}/module_${_module_id}.so.bc" OR
+       NOT EXISTS "${_module_ir_dir}/module_${_module_id}.so_cmd")
+      message(FATAL_ERROR "Module installation failed for ${_module_layout}.")
+    endif()
+    execute_process(
+      COMMAND bash "./module_${_module_id}.so_cmd"
+      WORKING_DIRECTORY "${_module_ir_dir}"
+      RESULT_VARIABLE _module_relink_result
+    )
+    if(NOT _module_relink_result EQUAL 0 OR
+       NOT EXISTS "${_module_ir_dir}/output/module_${_module_id}.so")
+      message(FATAL_ERROR "Installed module relink failed for ${_module_layout}.")
+    endif()
+  endforeach()
+  if(EXISTS "${_install_prefix}/llvmir" OR EXISTS "${_install_prefix}/lib/llvmir/share")
+    message(FATAL_ERROR "Module installation created an unexpected LLVM IR directory.")
+  endif()
   if(NOT _asm_shared_script MATCHES "\\./asm/[0-9a-f]+-asm_value\\.s\\.o" OR
      NOT _asm_shared_script MATCHES "--output=output/libasm_shared\\.so\\.1")
     message(FATAL_ERROR "Shared-library relink script does not reference the installed assembly object.")

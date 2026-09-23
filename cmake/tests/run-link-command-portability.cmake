@@ -23,6 +23,8 @@ endif()
 file(CREATE_LINK "${_library}" "${WORK_DIR}/libportable-dep.so" SYMBOLIC)
 
 function(_generate name command expect_failure version_script_name version_script_source)
+  set(_dynamic_list_name "${ARGV5}")
+  set(_dynamic_list_source "${ARGV6}")
   set(_native_link_file "${WORK_DIR}/${name}.link.txt")
   set(_link_script "${WORK_DIR}/${name}_cmd")
   file(WRITE "${_native_link_file}" "${command}\n")
@@ -31,6 +33,12 @@ function(_generate name command expect_failure version_script_name version_scrip
     list(APPEND _version_script_definitions
       "-DVERSION_SCRIPT_NAME=${version_script_name}"
       "-DVERSION_SCRIPT_SOURCE=${version_script_source}"
+    )
+  endif()
+  if(_dynamic_list_name)
+    list(APPEND _version_script_definitions
+      "-DDYNAMIC_LIST_NAME=${_dynamic_list_name}"
+      "-DDYNAMIC_LIST_SOURCE=${_dynamic_list_source}"
     )
   endif()
   execute_process(
@@ -102,6 +110,27 @@ string(FIND "${split-version-script_SCRIPT}" "${_libtool_version_script}" _sourc
 if(NOT _source_path EQUAL -1)
   message(FATAL_ERROR "Split version-script retained its build-tree source path:\n${split-version-script_SCRIPT}")
 endif()
+
+set(_dynamic_list "${WORK_DIR}/fixture.dynamic.list")
+file(WRITE "${_dynamic_list}" "{ portable_dep; };\n")
+_generate(split-linker-options
+  "${CMAKE_C_COMPILER} -Wl,--dynamic-list -Wl,${_dynamic_list} -Xlinker --version-script -Xlinker ${_libtool_version_script} -Wl,-rpath -Wl,\\$ORIGIN/../lib -Xlinker -rpath-link -Xlinker /private/build/link-lib -o fixture"
+  FALSE "fixture_verscript" "${_libtool_version_script}" "fixture_dynamiclist" "${_dynamic_list}")
+foreach(_expected IN ITEMS
+    "-Wl,--dynamic-list=./fixture_dynamiclist"
+    "-Wl,--version-script=./fixture_verscript"
+    "$ORIGIN/../lib")
+  string(FIND "${split-linker-options_SCRIPT}" "${_expected}" _position)
+  if(_position EQUAL -1)
+    message(FATAL_ERROR "Split linker option was not normalized: ${_expected}\n${split-linker-options_SCRIPT}")
+  endif()
+endforeach()
+foreach(_removed IN ITEMS "${_dynamic_list}" "${_libtool_version_script}" "/private/build/link-lib")
+  string(FIND "${split-linker-options_SCRIPT}" "${_removed}" _position)
+  if(NOT _position EQUAL -1)
+    message(FATAL_ERROR "Split linker option retained a build-tree path: ${_removed}\n${split-linker-options_SCRIPT}")
+  endif()
+endforeach()
 foreach(_preserved IN ITEMS "-L.." "-l:libportable-dep.so.1" "-Wl,--start-group" "-Wl,--whole-archive" "-Wl,--no-whole-archive" "-Wl,--end-group" "\$ORIGIN/../lib")
   string(FIND "${portable_SCRIPT}" "${_preserved}" _position)
   if(_position EQUAL -1)

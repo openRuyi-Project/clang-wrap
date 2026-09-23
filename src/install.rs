@@ -37,7 +37,7 @@ fn find_llvmir_files(source: &Path, llvmir_dir: &str) -> Vec<PathBuf> {
     for base in &bases {
         add_if_exists(&mut files, base.clone());
         add_if_exists(&mut files, base.with_extension("bc"));
-        for suffix in ["_cmd", "_verscript", "_missing"] {
+        for suffix in ["_cmd", "_verscript", "_dynamiclist", "_missing"] {
             add_if_exists(
                 &mut files,
                 PathBuf::from(format!("{}{suffix}", base.display())),
@@ -48,7 +48,7 @@ fn find_llvmir_files(source: &Path, llvmir_dir: &str) -> Vec<PathBuf> {
     if let Some(name) = source.file_name().and_then(|name| name.to_str()) {
         if let Some(name) = name.strip_suffix('T') {
             if let Some(parent) = bases[0].parent() {
-                for suffix in ["", ".bc", "_cmd", "_verscript", "_missing"] {
+                for suffix in ["", ".bc", "_cmd", "_verscript", "_dynamiclist", "_missing"] {
                     add_if_exists(&mut files, parent.join(format!("{name}{suffix}")));
                 }
             }
@@ -178,6 +178,9 @@ fn destination_filename(file: &Path, files: &[PathBuf], source: &Path, installed
         if name.ends_with("_verscript") {
             return format!("{base}_verscript");
         }
+        if name.ends_with("_dynamiclist") {
+            return format!("{base}_dynamiclist");
+        }
         if name.ends_with("_missing") {
             return format!("{base}_missing");
         }
@@ -203,6 +206,9 @@ fn destination_filename(file: &Path, files: &[PathBuf], source: &Path, installed
     if name.ends_with("_verscript") {
         return format!("{installed_name}_verscript");
     }
+    if name.ends_with("_dynamiclist") {
+        return format!("{installed_name}_dynamiclist");
+    }
     if name.ends_with("_missing") {
         return format!("{installed_name}_missing");
     }
@@ -214,10 +220,12 @@ fn destination_filename(file: &Path, files: &[PathBuf], source: &Path, installed
 
 fn rewrite_cmd(content: &str, source_name: &str, destination_name: &str) -> String {
     let verscript_marker = format!("__clang_wrap_{source_name}_verscript__");
+    let dynamiclist_marker = format!("__clang_wrap_{source_name}_dynamiclist__");
     content
         // Protect the version-script basename while replacing the main output
         // basename, since the latter is also a prefix of the former.
         .replace(&format!("{source_name}_verscript"), &verscript_marker)
+        .replace(&format!("{source_name}_dynamiclist"), &dynamiclist_marker)
         .replace(
             &format!("# Original output: {source_name}"),
             &format!("# Original output: {destination_name}"),
@@ -239,6 +247,10 @@ fn rewrite_cmd(content: &str, source_name: &str, destination_name: &str) -> Stri
             &format!("-o {destination_name}"),
         )
         .replace(&verscript_marker, &format!("{destination_name}_verscript"))
+        .replace(
+            &dynamiclist_marker,
+            &format!("{destination_name}_dynamiclist"),
+        )
 }
 
 fn copy_llvmir_file(source: &Path, destination: &Path) -> io::Result<()> {
