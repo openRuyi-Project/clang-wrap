@@ -11,7 +11,7 @@
 # Usage:
 #   Set the CMAKE_EMIT_LLVMIR environment variable before configuring:
 #     export CMAKE_EMIT_LLVMIR=1
-#     cmake -B build -S source -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=/path/to/CMakeEmitLLVMIR.cmake
+#     cmake -B build -S source -DCMAKE_PROJECT_INCLUDE=/path/to/CMakeEmitLLVMIR.cmake
 #
 #   Or include it in your CMakeLists.txt:
 #     include(CMakeEmitLLVMIR)

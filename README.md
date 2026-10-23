@@ -128,7 +128,9 @@ meson-install build/meson-info/intro-installed.json "$PWD/image"
 internally as a map from build product paths to configured absolute installation paths. For each
 entry that has LLVM IR in `LLVM_IR_DIR`, it copies the bitcode, `_cmd`, and `_verscript` files to
 the staging tree, using the same target layout and shared-library SONAME rewriting as the `install`
-wrapper. Build logs (`_log`) remain only in `LLVM_IR_DIR` and are not installed.
+wrapper. Build logs (`_log`) remain only in `LLVM_IR_DIR` and are not installed. The Mock plugin
+performs this step automatically from its install-post hook by finding Meson build directories and
+calling `meson-install` against `RPM_BUILD_ROOT`.
 
 ## License
 

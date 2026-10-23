@@ -30,8 +30,8 @@ export CMAKE_EMIT_LLVMIR=1
 # 2. Use Clang compiler
 export CC=clang
 
-# 3. Configure project (using CMAKE_PROJECT_TOP_LEVEL_INCLUDES)
-cmake -B build -S . -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=cmake/CMakeEmitLLVMIR.cmake
+# 3. Configure project (include after project() enables its languages)
+cmake -B build -S . -DCMAKE_PROJECT_INCLUDE=cmake/CMakeEmitLLVMIR.cmake
 
 # 4. Build project and LLVM IR artifacts
 cmake --build build
@@ -46,7 +46,7 @@ Run the repository's self-contained smoke test with:
 make smoke
 ```
 
-**Note:** `CMAKE_PROJECT_TOP_LEVEL_INCLUDES` works for both simple projects and projects that use `add_subdirectory()` to define targets in subdirectories (requires CMake 3.24+).
+**Note:** `CMAKE_PROJECT_INCLUDE` loads the module after `project()` enables languages, and works for projects that use `add_subdirectory()` to define targets in subdirectories.
 
 The module currently supports C and C++ source files only. Non-C/C++ sources are left to the native CMake build and are not included in the generated bitcode. Supported generators are Ninja and Unix Makefiles; other generators are rejected during configuration.
 
