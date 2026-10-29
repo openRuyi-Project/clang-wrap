@@ -168,6 +168,42 @@ fn main() {
         exit(1);
     }
 
+    // Libtool may pass native archive members through temporary `.lax`
+    // symlinks. Those links are removed before install-wrap consumes the
+    // `_missing` sidecar, so preserve a private copy while the member still
+    // exists. The copy is only a build-tree input; install-wrap publishes it
+    // under the final artifact's asm/ directory and removes the sidecar.
+    let native_members_dir =
+        PathBuf::from(format!("{}.native-members", llvm_archive_output.display()));
+    for (index, missing) in missing_ir_files.iter().enumerate() {
+        let Some(source) = missing.canonicalize().ok().filter(|path| path.is_file()) else {
+            continue;
+        };
+        let basename = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("native.o");
+        let destination = native_members_dir.join(format!("{index}-{basename}"));
+        if let Err(error) = ensure_dir_exists(&destination).and_then(|_| {
+            fs::copy(&source, &destination)
+                .map(|_| ())
+                .map_err(std::io::Error::other)
+        }) {
+            debug_log(
+                debug,
+                &format!(
+                    "[DEBUG] Failed to preserve native archive member {}: {}",
+                    source.display(),
+                    error
+                ),
+            );
+        } else {
+            // Keep the original path in `_missing` for compatibility. The
+            // installer can resolve it from this stable cache if libtool has
+            // already removed the temporary `.lax` symlink.
+        }
+    }
+
     let missing_path = PathBuf::from(format!("{}_missing", llvm_archive_output.display()));
     if missing_ir_files.is_empty() {
         if let Err(e) = fs::remove_file(&missing_path) {

@@ -464,8 +464,10 @@ foreach(_argument IN LISTS _arguments)
     get_filename_component(_argument_name "${_argument}" NAME)
     set(_is_project_shared_library FALSE)
     foreach(_project_shared_name IN LISTS PROJECT_SHARED_LIBRARIES)
+      # Library names may contain regex metacharacters, such as libFLAC++.
+      string(FIND "${_argument_name}" "${_project_shared_name}." _project_shared_prefix)
       if(_argument_name STREQUAL "${_project_shared_name}" OR
-         _argument_name MATCHES "^${_project_shared_name}\\.")
+         _project_shared_prefix EQUAL 0)
         set(_is_project_shared_library TRUE)
         break()
       endif()

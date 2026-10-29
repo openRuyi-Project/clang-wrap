@@ -867,7 +867,7 @@ function(cmake_emit_llvmir_process_target target)
   get_target_property(_target_name ${target} NAME)
   get_target_property(_target_sources ${target} SOURCES)
 
-  if(_target_type STREQUAL "INTERFACE_LIBRARY" OR _target_type STREQUAL "OBJECT_LIBRARY")
+  if(NOT _target_type MATCHES "^(EXECUTABLE|STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY)$")
     return()
   endif()
 

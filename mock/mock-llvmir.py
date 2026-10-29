@@ -89,8 +89,9 @@ def _files_section_rules(spec_text):
             rules.append((package, "@manifest@" + manifest))
         for line in body:
             value = line.strip()
-            if not value or value.startswith("#") or value.startswith("%exclude"):
+            if not value or value.startswith("#"):
                 continue
+            excluded = value.startswith("%exclude ")
             tokens = shlex.split(value)
             if not tokens:
                 continue
@@ -102,7 +103,7 @@ def _files_section_rules(spec_text):
                 continue
             path = tokens[-1]
             if path.startswith(("/", "%{")):
-                rules.append((package, path))
+                rules.append((package, "@exclude@" + path if excluded else path))
     return rules
 
 
@@ -175,6 +176,9 @@ def owner_rule_config(spec_path, expanded_text=None):
         if path.startswith("@manifest@"):
             manifest = path[len("@manifest@"):]
             rules.append({"package": package, "path": manifest, "manifest": True})
+        elif path.startswith("@exclude@"):
+            rules.append({"package": package, "path": path[len("@exclude@"):],
+                          "manifest": False, "exclude": True})
         else:
             rules.append({"package": package, "path": path, "manifest": False})
     return rules
@@ -213,10 +217,7 @@ def infer_package_owner(candidate_paths, rules):
                 matches.append(package)
     if not matches:
         return None
-    owners = sorted(set(matches))
-    if len(owners) != 1:
-        raise ValueError("ambiguous RPM package ownership: %s" % ", ".join(owners))
-    return owners[0]
+    return sorted(set(matches))
 
 
 def _llvmir_package_name(package, suffix):

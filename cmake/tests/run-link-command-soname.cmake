@@ -23,10 +23,19 @@ if(NOT _compile_result EQUAL 0)
   message(FATAL_ERROR "Could not build SONAME fixture:\n${_compile_output}${_compile_error}")
 endif()
 file(CREATE_LINK "${_library}" "${WORK_DIR}/libsoname-fixture.so" SYMBOLIC)
+file(CREATE_LINK "${_library}" "${WORK_DIR}/libsoname-fixture++.so.7.3.9" SYMBOLIC)
 
-foreach(_case IN ITEMS absolute colon bare explicit-opt)
+foreach(_case IN ITEMS absolute colon bare explicit-opt project-exact project-versioned)
+  set(_project_shared_names "")
   if(_case STREQUAL "absolute")
     set(_library_argument "${_library}")
+  elseif(_case STREQUAL "project-exact" OR _case STREQUAL "project-versioned")
+    set(_library_argument "libsoname-fixture++.so.7.3.9")
+    if(_case STREQUAL "project-exact")
+      set(_project_shared_names "libsoname-fixture++.so.7.3.9")
+    else()
+      set(_project_shared_names "libsoname-fixture++.so.7.3")
+    endif()
   elseif(_case STREQUAL "colon")
     set(_library_argument "-l:libsoname-fixture.so.7.3.9")
   elseif(_case STREQUAL "explicit-opt")
@@ -55,6 +64,7 @@ foreach(_case IN ITEMS absolute colon bare explicit-opt)
       "-DNINJA_BUILD_DIR=${WORK_DIR}"
       "-DTARGET_BINARY_DIR=${WORK_DIR}"
       "-DLINK_SEARCH_DIRS=${WORK_DIR}"
+      "-DPROJECT_SHARED_LIBRARIES=${_project_shared_names}"
       "-DCLANG_VERSION_LINE=clang test version"
       "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
       -P "${SCRIPT}"

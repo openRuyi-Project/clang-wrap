@@ -234,6 +234,55 @@ pub fn find_llvmir_file(file_path: &Path, llvmir_dir: &str) -> Option<PathBuf> {
     find_llvmir_file_impl(file_path, llvmir_dir, false)
 }
 
+/// Return whether a file is a native ELF object.
+///
+/// Clang accepts assembly input together with `-emit-llvm` but may still
+/// produce a native ELF object when the input cannot be represented as LLVM
+/// IR.  The output path then exists, although passing it to `llvm-link` is
+/// invalid.  LLVM bitcode has a stable four-byte magic for both regular and
+/// wrapped bitcode files, so checking it is sufficient and avoids invoking a
+/// version-specific LLVM utility for every object lookup.
+pub fn is_native_elf_object(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+
+    bytes.starts_with(b"\x7fELF")
+}
+
+/// Return whether a file has one of LLVM's bitcode magic headers.
+pub fn is_valid_llvm_bitcode(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+
+    bytes.starts_with(b"BC\xc0\xde") || bytes.starts_with(b"\xde\xc0\x17\x0b")
+}
+
+#[cfg(test)]
+mod llvm_bitcode_tests {
+    use super::is_native_elf_object;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn distinguishes_bitcode_from_native_object() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("clang-wrap-bitcode-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let native = directory.join("module.o");
+        fs::write(&native, b"\x7fELF\x02\x01\x01\x00").unwrap();
+
+        assert!(!is_native_elf_object(&directory.join("missing")));
+        assert!(is_native_elf_object(&native));
+
+        let _ = fs::remove_dir_all(directory);
+    }
+}
+
 /// Find corresponding LLVM IR file in llvmir directory (with debug output)
 pub fn find_llvmir_file_with_debug(
     file_path: &Path,
@@ -258,7 +307,7 @@ fn find_llvmir_file_impl(file_path: &Path, llvmir_dir: &str, debug: bool) -> Opt
     ir_path.push(rel_path);
     debug_log(debug, &format!("[DEBUG]   llvmir path: {:?}", ir_path));
 
-    if ir_path.exists() {
+    if ir_path.is_file() && !is_native_elf_object(&ir_path) {
         debug_log(debug, &format!("[DEBUG]   Found at: {:?}", ir_path));
         return Some(ir_path);
     }
@@ -266,7 +315,7 @@ fn find_llvmir_file_impl(file_path: &Path, llvmir_dir: &str, debug: bool) -> Opt
     // Check .bc extension (LLVM bitcode)
     debug_log(debug, "[DEBUG]   Not found, trying .bc extension");
     let ir_path_bc = ir_path.with_extension("bc");
-    if ir_path_bc.exists() {
+    if ir_path_bc.is_file() && !is_native_elf_object(&ir_path_bc) {
         debug_log(debug, &format!("[DEBUG]   Found at: {:?}", ir_path_bc));
         return Some(ir_path_bc);
     }

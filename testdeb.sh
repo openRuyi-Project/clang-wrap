@@ -57,7 +57,7 @@ test_pcre2() {
 		cd testdeb/pcre2
 		rm -rf pcre2*
 		#apt-get source pcre2
-		dget -x -u http://mirrors.bfsu.edu.cn/debian/pool/main/p/pcre2/pcre2_10.47-2.dsc
+		dget -x -u http://mirror.iscas.ac.cn/debian/pool/main/p/pcre2/pcre2_10.48-3.1.dsc
 		cd pcre2-*
 		mkdir -p build-with-clangwrap && cd build-with-clangwrap
 		rm -rf ~/tmp/llvmir/`pwd`
@@ -207,7 +207,7 @@ test_x264() {
 		cd ${pkg}-*
 		mkdir -p build-with-clangwrap && cd build-with-clangwrap
 		rm -rf ~/tmp/llvmir/`pwd`
-		CC=clang ../configure --enable-shared --disable-asm && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		CC=clang ../configure --enable-shared && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
 		run_llvmir_cmds install/usr/local/lib/llvmir
 		run_llvmir_cmds install/usr/local/lib/llvmir-bin
 	)
@@ -292,6 +292,29 @@ test_gsl() {
 	)
 }
 
+# 测试 libfyaml
+test_libfyaml() {
+	pkg=libfyaml
+	export CLANG_WRAP_DEBUG=1
+	export EMIT_LLVMIR=-march=native
+	export PATH=`pwd`/clang-wrap-install/bin:$PATH
+	mkdir -p testdeb/$pkg
+	(
+		cd testdeb/$pkg
+		rm -rf ${pkg}*
+		apt-get source $pkg
+		cd ${pkg}-*
+		dh_autoreconf
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		rm -rf ~/tmp/llvmir/`pwd`
+		CC=clang CXX=clang++ ../configure
+		make V=1 -j`nproc`
+		make install DESTDIR=`pwd`/install
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
+}
+
 # 测试 pixman（Meson 构建与安装）
 test_pixman() {
 	pkg=pixman
@@ -335,6 +358,7 @@ show_help() {
 	echo "  sqlite3      - 测试 sqlite3 包"
 	echo "  libpcap      - 测试 libpcap 包"
 	echo "  gsl          - 测试 gsl 包"
+	echo "  libfyaml     - 测试 libfyaml 包"
 	echo "  pixman       - 测试 pixman 包（Meson）"
 	echo "  all          - 构建并测试所有包"
 	echo "  help         - 显示此帮助信息"
@@ -387,6 +411,9 @@ main() {
 		gsl)
 			test_gsl
 			;;
+		libfyaml)
+			test_libfyaml
+			;;
 		pixman)
 			test_pixman
 			;;
@@ -405,6 +432,7 @@ main() {
 			test_sqlite3
 			test_libpcap
 			test_gsl
+			test_libfyaml
 			test_pixman
 			;;
 		help|-h|--help)

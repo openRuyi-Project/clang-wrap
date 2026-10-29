@@ -221,7 +221,7 @@ fn destination_filename(file: &Path, files: &[PathBuf], source: &Path, installed
 fn rewrite_cmd(content: &str, source_name: &str, destination_name: &str) -> String {
     let verscript_marker = format!("__clang_wrap_{source_name}_verscript__");
     let dynamiclist_marker = format!("__clang_wrap_{source_name}_dynamiclist__");
-    content
+    let rewritten = content
         // Protect the version-script basename while replacing the main output
         // basename, since the latter is also a prefix of the former.
         .replace(&format!("{source_name}_verscript"), &verscript_marker)
@@ -250,7 +250,17 @@ fn rewrite_cmd(content: &str, source_name: &str, destination_name: &str) -> Stri
         .replace(
             &dynamiclist_marker,
             &format!("{destination_name}_dynamiclist"),
-        )
+        );
+
+    rewritten
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.contains("-l:") && trimmed.ends_with(".a"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if content.ends_with('\n') { "\n" } else { "" }
 }
 
 fn copy_llvmir_file(source: &Path, destination: &Path) -> io::Result<()> {
@@ -290,12 +300,43 @@ fn copy_llvmir_file(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn resolve_missing_object(path: &Path, missing_source: &Path) -> PathBuf {
+    if path.is_file() {
+        return path.to_path_buf();
+    }
+    let Some(base) = missing_source
+        .to_str()
+        .and_then(|value| value.strip_suffix("_missing"))
+    else {
+        return path.to_path_buf();
+    };
+    let cache_dir = PathBuf::from(format!("{base}.native-members"));
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    fs::read_dir(cache_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|candidate| {
+            candidate.file_name().is_some_and(|candidate_name| {
+                candidate_name
+                    .to_string_lossy()
+                    .ends_with(name.to_string_lossy().as_ref())
+            })
+        })
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 fn missing_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
     fs::read_to_string(path).map(|content| {
         content
             .lines()
             .filter(|line| !line.is_empty())
             .map(PathBuf::from)
+            .map(|object| resolve_missing_object(&object, path))
             .collect()
     })
 }
@@ -342,6 +383,7 @@ fn inject_asm_objects_into_cmd(cmd_destination: &Path, missing_source: &Path) ->
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| PathBuf::from(line.trim()))
+        .map(|object| resolve_missing_object(&object, missing_source))
         .filter(|p| p.is_absolute())
         .collect();
 
@@ -414,13 +456,21 @@ fn inject_asm_objects_into_cmd(cmd_destination: &Path, missing_source: &Path) ->
         if trimmed.is_empty() {
             continue;
         }
-        // Skip static library references.
-        if trimmed.ends_with("libmixed.a") || trimmed.ends_with("libmixed.aT") {
+        // Static archive members were already merged into the main bitcode
+        // during the build-time LLVM merge. Do not link the build archive a
+        // second time from the installed command.
+        if trimmed.ends_with("libmixed.a")
+            || trimmed.ends_with("libmixed.aT")
+            || (trimmed.starts_with("-l:") && trimmed.ends_with(".a"))
+        {
             continue;
         }
         // Save --output= for the end.
         if trimmed.starts_with("--output=") {
             output_args.push(format!("  {trimmed}\n"));
+            continue;
+        }
+        if trimmed.contains("-l:") && trimmed.ends_with(".a") {
             continue;
         }
         // Skip absolute-path -Wl,<abs_path> lines; they are replaced below.

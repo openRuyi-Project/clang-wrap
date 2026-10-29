@@ -2301,7 +2301,7 @@ test_json_c() {
             print_error "未找到分发的 json-c 版本脚本：$version_script"
             return 1
         fi
-        if ! grep -Fq -- "-Wl,--version-script,./${soname}_verscript" "$link_script"; then
+        if ! grep -Fq -- "-Wl,--version-script=./${soname}_verscript" "$link_script"; then
             print_error "json-c 链接脚本未使用分发的相对版本脚本路径"
             return 1
         fi
@@ -2544,6 +2544,42 @@ test_mariadb() {
     test_link_scripts "$install_dir"
 }
 
+# 测试 ecbuild 项目（CMake 构建系统工具）
+test_ecbuild() {
+    local project_name="ecbuild"
+    local project_dir="$(prepare_source "$project_name" "$project_name")"
+    local build_dir="${BUILD_BASE_DIR}/${project_name}"
+    local install_dir="${INSTALL_BASE_DIR}/${project_name}"
+
+    print_header "测试 $project_name (CMake 构建系统工具)"
+
+    if [ ! -f "$project_dir/CMakeLists.txt" ]; then
+        print_error "项目目录不存在或缺少 CMakeLists.txt：$project_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir" "$install_dir"
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+
+    print_info "配置项目..."
+    CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        "$project_dir"
+
+    print_info "构建项目..."
+    cmake --build . -j$(nproc) -v
+
+    print_info "安装项目..."
+    cmake --install . --prefix "$install_dir"
+
+    print_success "$project_name 测试通过"
+}
+
 # 显示帮助信息
 show_help() {
     echo "CMakeEmitLLVMIR 项目测试脚本"
@@ -2582,6 +2618,7 @@ show_help() {
     echo "  libogg         - 测试 libogg 动态库和静态库"
     echo "  libzstd        - Zstandard 压缩库"
     echo "  mariadb        - MariaDB（CMake，含 embedded server 动态库）"
+    echo "  ecbuild        - ecbuild（CMake 构建系统工具）"
     echo ""
     echo "注意：leveldb、spdlog、googletest、cpuinfo、glfw、yaml-cpp、libxml2, armadillo、libwebp 和 highway 支持静态库和动态库分别测试"
     echo "  leveldb-static   - 测试 leveldb 静态库"
@@ -2833,6 +2870,9 @@ main() {
                     ;;
                 mariadb)
                     test_mariadb
+                    ;;
+                ecbuild)
+                    test_ecbuild
                     ;;
                 *)
                     print_error "未知项目：$project"

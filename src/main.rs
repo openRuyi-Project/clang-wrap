@@ -7,7 +7,7 @@
 //!
 //! Generate LLVM IR during compilation, use llvm-link to merge LLVM IR files during linking
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
@@ -19,7 +19,8 @@ use goblin::elf::Elf;
 use clang_wrap::{
     append_tmp_suffix, debug_log, ensure_dir_exists, expand_at_file_args, find_llvm_tool,
     find_llvmir_file, generate_tmp_suffix, get_absolute_path, get_emit_llvmir_opt, get_exe_path,
-    get_llvm_ir_dir, get_program_name, init_debug_log, is_debug_mode, shell_escape,
+    get_llvm_ir_dir, get_program_name, init_debug_log, is_debug_mode, is_native_elf_object,
+    is_valid_llvm_bitcode, shell_escape,
 };
 
 // ============================================================================
@@ -582,6 +583,80 @@ mod tests {
     }
 
     #[test]
+    fn archive_members_with_duplicate_names_preserve_dependency_closure() {
+        let dir = unique_temp_dir("llvm-link-duplicate-members");
+        let clang = find_llvm_tool("clang", "clang");
+        let llvm_ar = find_llvm_tool("llvm-ar", "clang");
+        let llvm_link = find_llvm_tool("llvm-link", "clang");
+        let nm = find_llvm_tool("llvm-nm", "clang");
+        let direct = dir.join("main.o");
+        let archive = dir.join("libduplicate.a");
+        for (name, source) in [
+            (
+                "main",
+                "int first(void); int main(void) { return first() != 7; }",
+            ),
+            (
+                "common/member",
+                "int second(void); int first(void) { return second(); }",
+            ),
+            ("encoder/member", "int second(void) { return 7; }"),
+        ] {
+            let source_path = dir.join(format!("{name}.c"));
+            fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+            fs::write(&source_path, source).unwrap();
+            assert!(Command::new(&clang)
+                .args(["-emit-llvm", "-c", "-O0"])
+                .arg(&source_path)
+                .arg("-o")
+                .arg(dir.join(format!("{name}.o")))
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(Command::new(&llvm_ar)
+            .arg("rcsD")
+            .arg(&archive)
+            .arg(dir.join("common/member.o"))
+            .arg(dir.join("encoder/member.o"))
+            .status()
+            .unwrap()
+            .success());
+        let members =
+            extract_archive_members(&llvm_ar, &nm, &archive, &dir.join("members")).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members[0].symbols.defined.contains("first"));
+        assert!(members[1].symbols.defined.contains("second"));
+        for whole in [false, true] {
+            let output = dir.join(if whole { "whole.bc" } else { "selected.bc" });
+            let log = File::create(dir.join("merge.log")).unwrap();
+            let archives = std::slice::from_ref(&archive);
+            merge_llvm_ir(
+                &llvm_link,
+                &output,
+                std::slice::from_ref(&direct),
+                if whole { &[] } else { archives },
+                if whole { archives } else { &[] },
+                &log,
+            )
+            .unwrap();
+            let symbols = read_bitcode_symbols(&nm, &output).unwrap();
+            assert!(symbols.defined.contains("first"));
+            assert!(symbols.defined.contains("second"));
+            let executable = dir.join(if whole { "whole" } else { "selected" });
+            assert!(Command::new(&clang)
+                .arg(&output)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new(&executable).status().unwrap().success());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn whole_archive_bitcode_is_merged_without_symbol_selection() {
         let dir = unique_temp_dir("llvm-link-whole-archive");
         let linker = dir.join("fake-llvm-link");
@@ -799,6 +874,34 @@ fn resolve_link_library(lib: &str, library_dirs: &[String], clang_path: &Path) -
         }
     }
 
+    // Libtool convenience archives are often passed as `-l:foo.a` without a
+    // corresponding -L option. The native link succeeds because it runs from
+    // the libtool target directory, while the LLVM sidecar needs the actual
+    // archive path to find its bitcode. Search the current build directory,
+    // its .libs directory, and sibling .libs directories on the way upward.
+    if let Some(exact_name) = lib.strip_prefix(':') {
+        let mut directory = env::current_dir().ok();
+        while let Some(current) = directory {
+            for candidate in [
+                current.join(exact_name),
+                current.join(".libs").join(exact_name),
+            ] {
+                if candidate.is_file() {
+                    return Some(canonical_or_absolute_path(&candidate));
+                }
+            }
+            if let Ok(entries) = fs::read_dir(&current) {
+                for entry in entries.filter_map(Result::ok) {
+                    let candidate = entry.path().join(".libs").join(exact_name);
+                    if candidate.is_file() {
+                        return Some(canonical_or_absolute_path(&candidate));
+                    }
+                }
+            }
+            directory = current.parent().map(Path::to_path_buf);
+        }
+    }
+
     for dir in default_library_dirs(clang_path) {
         if let Some(path) = resolve_library_in_dir(&dir, lib) {
             return Some(path);
@@ -822,6 +925,29 @@ fn exact_link_arg_for_library_path(path: &Path) -> Option<String> {
         let name = shared_library_soname(path).unwrap_or_else(|| name.to_string());
         format!("-l:{}", name)
     })
+}
+
+fn exact_link_arg_for_archive_path(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("-l:{name}"))
+}
+
+fn libtool_archive_path(path: &Path) -> Option<PathBuf> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("la") {
+        return None;
+    }
+    let content = fs::read_to_string(path).ok()?;
+    let old_library = content
+        .lines()
+        .find_map(|line| line.strip_prefix("old_library='")?.strip_suffix('\''))?;
+    if old_library.is_empty() {
+        return None;
+    }
+    let archive = path.parent()?.join(old_library);
+    archive
+        .is_file()
+        .then_some(canonical_or_absolute_path(&archive))
 }
 
 fn push_array_arg(script: &mut String, arg: &str) {
@@ -1174,6 +1300,7 @@ fn is_optimization_level_arg(arg: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 fn has_whole_archive_option(args: &[String]) -> bool {
     args.iter().enumerate().any(|(index, arg)| {
         arg.strip_prefix("-Wl,")
@@ -1436,27 +1563,71 @@ fn extract_archive_members(
         )));
     }
 
-    let mut members = Vec::new();
-    for (index, name) in String::from_utf8_lossy(&listed.stdout)
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    let names = listing
         .lines()
         .filter(|name| !name.is_empty())
-        .enumerate()
-    {
-        let path = directory.join(format!("{index}-{}", Path::new(name).display()));
-        let extracted = Command::new(llvm_ar)
-            .arg("p")
-            .arg(archive)
-            .arg(name)
-            .output()?;
-        if !extracted.status.success() {
-            return Err(std::io::Error::other(format!(
-                "{} failed to extract {} from {}",
-                llvm_ar.display(),
-                name,
-                archive.display()
-            )));
+        .collect::<Vec<_>>();
+    let mut counts = HashMap::new();
+    for name in &names {
+        *counts.entry(*name).or_insert(0usize) += 1;
+    }
+    let mut occurrences = HashMap::new();
+    let mut members = Vec::new();
+    for (index, name) in names.into_iter().enumerate() {
+        let basename = Path::new(name)
+            .file_name()
+            .ok_or_else(|| std::io::Error::other(format!("Invalid archive member name: {name}")))?;
+        let path = directory.join(format!("{index}-{}", basename.to_string_lossy()));
+        let occurrence = occurrences.entry(name).or_insert(0usize);
+        *occurrence += 1;
+        // `ar p` only returns the first member with a matching name. Archives
+        // such as x264 contain distinct common/set.o and encoder/set.o members
+        // stored under the same basename; extract each occurrence explicitly.
+        if counts[name] > 1 {
+            let member_directory = directory.join(format!("member-{index}"));
+            fs::create_dir_all(&member_directory)?;
+            let extracted = Command::new(llvm_ar)
+                .arg("xN")
+                .arg(occurrence.to_string())
+                .arg(archive)
+                .arg(name)
+                .arg("--output")
+                .arg(&member_directory)
+                .output()?;
+            if !extracted.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "{} failed to extract occurrence {} of {} from {}: {}",
+                    llvm_ar.display(),
+                    occurrence,
+                    name,
+                    archive.display(),
+                    String::from_utf8_lossy(&extracted.stderr)
+                )));
+            }
+            fs::rename(member_directory.join(basename), &path)?;
+        } else {
+            let extracted = Command::new(llvm_ar)
+                .arg("p")
+                .arg(archive)
+                .arg(name)
+                .output()?;
+            if !extracted.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "{} failed to extract {} from {}",
+                    llvm_ar.display(),
+                    name,
+                    archive.display()
+                )));
+            }
+            fs::write(&path, extracted.stdout)?;
         }
-        fs::write(&path, extracted.stdout)?;
+        if is_native_elf_object(&path) {
+            // A stale or externally-created LLVM archive can contain native
+            // members. They must not be handed to llvm-link as bitcode.
+            let _ = fs::remove_file(&path);
+            continue;
+        }
         members.push(ArchiveMember {
             symbols: read_bitcode_symbols(nm, &path)?,
             path,
@@ -1577,6 +1748,7 @@ fn merge_llvm_ir(
                 .and_then(|name| name.to_str())
                 .unwrap_or("llvm-link"),
         );
+        let mut inputs = direct_inputs.to_vec();
         let (selected_members, _) = select_archive_members(
             &llvm_ar,
             &nm,
@@ -1584,7 +1756,6 @@ fn merge_llvm_ir(
             direct_inputs,
             &work_directory,
         )?;
-        let mut inputs = direct_inputs.to_vec();
         inputs.extend(selected_members);
         if !whole_archives.is_empty() {
             let mut whole_members = Vec::new();
@@ -1656,15 +1827,31 @@ fn handle_link_command(
                 i += 2;
                 continue;
             }
+        } else if let Some(exact_name) = arg.strip_prefix("-l:") {
+            if exact_name.ends_with(".a") {
+                if let Some(library_file) =
+                    resolve_link_library(&format!(":{exact_name}"), &library_dirs, clang_path)
+                {
+                    if whole_archive_active {
+                        whole_archive_files.push(library_file);
+                    } else {
+                        library_files.push(library_file);
+                    }
+                }
+            }
         } else if arg.starts_with("-l") && arg.len() > 2 {
         } else if arg.ends_with(".o") && !arg.starts_with('-') {
             object_files.push(PathBuf::from(arg));
         } else if !arg.starts_with('-') && SOURCE_EXTENSIONS.iter().any(|ext| arg.ends_with(ext)) {
             source_files.push(PathBuf::from(arg));
         } else if !arg.starts_with('-')
-            && (arg.ends_with(".so") || arg.contains(".so.") || arg.ends_with(".a"))
+            && (arg.ends_with(".so")
+                || arg.contains(".so.")
+                || arg.ends_with(".a")
+                || arg.ends_with(".la"))
         {
-            let library_file = PathBuf::from(arg);
+            let library_file =
+                libtool_archive_path(Path::new(arg)).unwrap_or_else(|| PathBuf::from(arg));
             if whole_archive_active && library_file.extension().is_some_and(|ext| ext == "a") {
                 whole_archive_files.push(library_file);
             } else {
@@ -1703,6 +1890,25 @@ fn handle_link_command(
             // archives *inside* the whole-archive span, leaving no standalone
             // `.a` token for the normal parser to see.
             whole_archive_files.extend(whole_archives_in_wl_arg(&normalized_arg));
+            if let Some(payload) = normalized_arg.strip_prefix("-Wl,") {
+                let mut embedded_whole_archive = whole_archive_active;
+                for option in payload.split(',') {
+                    match option {
+                        "--whole-archive" => embedded_whole_archive = true,
+                        "--no-whole-archive" => embedded_whole_archive = false,
+                        value if embedded_whole_archive && value.starts_with("-l:") => {
+                            if let Some(library_file) = resolve_link_library(
+                                value.trim_start_matches("-l"),
+                                &library_dirs,
+                                clang_path,
+                            ) {
+                                whole_archive_files.push(library_file);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             if normalized_arg == "-Wl,--whole-archive" {
                 whole_archive_active = true;
@@ -1768,7 +1974,10 @@ fn handle_link_command(
             let mut ir_path = PathBuf::from(llvm_ir_dir);
             let rel_path = candidate.strip_prefix("/").unwrap_or(&candidate);
             ir_path.push(rel_path);
-            ir_path.exists().then_some(ir_path)
+            ir_path
+                .is_file()
+                .then(|| !is_native_elf_object(&ir_path))
+                .and_then(|valid| valid.then_some(ir_path))
         });
 
         if let Some(ir_path) = ir_path {
@@ -1897,16 +2106,6 @@ fn handle_link_command(
         }
     }
 
-    // Libtool's convenience archives are commonly passed via an argv shape
-    // that records `--whole-archive` separately from the archive paths.  If
-    // that shape was not associated with a concrete input above, preserving
-    // normal archive selection would silently discard public API members.
-    // Promote the collected archives as a conservative fallback; this keeps
-    // the shared-library IR equivalent to the native link.
-    if whole_llvm_archives.is_empty() && has_whole_archive_option(&args[1..]) {
-        whole_llvm_archives.append(&mut static_llvm_archives);
-    }
-
     if direct_llvm_ir_files.is_empty()
         && static_llvm_archives.is_empty()
         && whole_llvm_archives.is_empty()
@@ -1952,10 +2151,10 @@ fn handle_link_command(
     debug_log(
         debug_mode,
         &format!(
-            "[DEBUG] LLVM IR merge: {} direct input(s), {} selected static archive(s), {} whole static archive(s)",
+            "[DEBUG] LLVM IR merge: {} direct input(s), {} static archive(s), {} whole archive(s)",
             direct_llvm_ir_files.len(),
             static_llvm_archives.len(),
-            whole_llvm_archives.len()
+            whole_llvm_archives.len(),
         ),
     );
     match merge_llvm_ir(
@@ -2111,7 +2310,8 @@ fn generate_link_cmd_file(
     missing_ir_files: &[PathBuf],
 ) -> Result<(), std::io::Error> {
     let cmd_path = format!("{}_cmd", llvm_link_output.display());
-    let normalized_args = normalize_linker_arguments(original_args);
+    let mut normalized_args = normalize_linker_arguments(original_args);
+    normalized_args.retain(|arg| !(arg.contains("-l:") && arg.ends_with(".a")));
 
     let bc_filename = llvm_link_output
         .file_name()
@@ -2180,8 +2380,6 @@ fn generate_link_cmd_file(
     script.push_str("cmd=(\n");
     push_array_arg(&mut script, &cmd_clang_path.display().to_string());
 
-    push_array_arg(&mut script, "-x");
-    push_array_arg(&mut script, "ir");
     push_array_arg(&mut script, "-fuse-ld=lld");
     // Installed executable commands live in lib/llvmir-bin, while shared
     // libraries from the same package live in the parent lib directory.
@@ -2222,11 +2420,9 @@ fn generate_link_cmd_file(
             index += 1;
             continue;
         }
-        if arg == "-L" {
-            if next.is_some() {
-                index += 2;
-                continue;
-            }
+        if arg == "-L" && next.is_some() {
+            index += 2;
+            continue;
         }
         if arg.starts_with("-L") && arg.len() > 2 {
             // Libraries are converted to exact -l:SONAME references below.
@@ -2278,6 +2474,10 @@ fn generate_link_cmd_file(
         }
         if arg == "-Wl,--dependency-file" {
             index += 2;
+            continue;
+        }
+        if arg.contains("-l:") || arg.contains("-l,") {
+            index += 1;
             continue;
         }
         if arg == "-l" {
@@ -2371,15 +2571,34 @@ fn generate_link_cmd_file(
             index += usize::from(next.is_some()) + 1;
             continue;
         }
+        // Static LLVM archives are merged into the aggregate bitcode above.
+        // Keep their native fallback members through _missing/asm, but do not
+        // leave the build-tree archive itself in the installed relink script.
         let is_native_input = !arg.starts_with('-')
             && (arg.ends_with(".o")
                 || SOURCE_EXTENSIONS
                     .iter()
                     .any(|extension| arg.ends_with(extension))
-                || arg.ends_with(".a"));
+                || arg.ends_with(".a")
+                || arg.ends_with(".la"));
         if is_native_input {
+            if arg.ends_with(".a") || arg.ends_with(".la") {
+                let archive_path =
+                    libtool_archive_path(Path::new(arg)).unwrap_or_else(|| PathBuf::from(arg));
+                if let Some(rewritten) = exact_link_arg_for_archive_path(&archive_path) {
+                    push_array_arg(&mut script, &rewritten);
+                } else {
+                    push_array_arg(&mut script, arg);
+                }
+                index += 1;
+                continue;
+            }
             if !emitted_bitcode {
+                push_array_arg(&mut script, "-x");
+                push_array_arg(&mut script, "ir");
                 push_array_arg(&mut script, &format!("./{bc_filename}"));
+                push_array_arg(&mut script, "-x");
+                push_array_arg(&mut script, "none");
                 for missing_path in missing_ir_files {
                     push_array_arg(&mut script, &format!("-Wl,{}", missing_path.display()));
                 }
@@ -2401,7 +2620,11 @@ fn generate_link_cmd_file(
         index += 1;
     }
     if !emitted_bitcode {
+        push_array_arg(&mut script, "-x");
+        push_array_arg(&mut script, "ir");
         push_array_arg(&mut script, &format!("./{bc_filename}"));
+        push_array_arg(&mut script, "-x");
+        push_array_arg(&mut script, "none");
         for missing_path in missing_ir_files {
             push_array_arg(&mut script, &format!("-Wl,{}", missing_path.display()));
         }
@@ -2715,7 +2938,23 @@ fn main() {
         llvm_cmd.stderr(Stdio::from(log_file));
 
         match llvm_cmd.status() {
-            Ok(status) if status.success() => {}
+            Ok(status) if status.success() => {
+                if !is_valid_llvm_bitcode(&llvm_ir_path) {
+                    // Assembly sources may accept -emit-llvm but still produce
+                    // a native ELF object.  Keep the real object for the
+                    // native link and let ar-wrap/final-link handling record
+                    // it as an asm fallback instead of feeding it to
+                    // llvm-link.
+                    let _ = fs::remove_file(&llvm_ir_path);
+                    debug_log(
+                        debug_mode,
+                        &format!(
+                            "[DEBUG] LLVM IR output for {} is not bitcode; keeping native object",
+                            input_file.display()
+                        ),
+                    );
+                }
+            }
             Ok(status) => {
                 let _ = fs::remove_file(&llvm_ir_path);
                 if output_path.exists() {

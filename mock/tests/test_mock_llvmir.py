@@ -366,19 +366,78 @@ fixture
         self.assertIn(("%{name}-libs", "%{_libdir}/libfixture.so.*"), rules)
         self.assertIn(("%{name}-libs", "%{_sysconfdir}/fixture.conf"), rules)
 
-    def test_wildcard_and_specific_rules_are_ambiguous(self):
-        with self.assertRaisesRegex(ValueError, "ambiguous RPM package ownership"):
-            plugin.infer_package_owner(
-                ["/usr/bin/fixture"],
-                [("%{name}", "/usr/bin/*"), ("%{name}-tools", "/usr/bin/fixture")],
-            )
+    def test_owner_rules_preserve_package_exclusions(self):
+        rules = plugin.owner_rule_config(Path("unused.spec"), expanded_text="""Name: fixture
+%files client
+/usr/bin/virt-admin
+%files others
+/usr/bin/virt*
+%exclude /usr/bin/virt-admin
+""")
+        self.assertIn({"package": "%{name}-others", "path": "/usr/bin/virt-admin",
+                       "manifest": False, "exclude": True}, rules)
 
-    def test_equal_specificity_owner_collision_fails(self):
-        with self.assertRaisesRegex(ValueError, "ambiguous RPM package ownership"):
-            plugin.infer_package_owner(
+    def test_file_rule_globs_respect_directory_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "usr/lib64/libvirt/connection-driver").mkdir(parents=True)
+            candidate = "/usr/lib64/libvirt/connection-driver/libvirt_driver_qemu.so"
+            self.assertFalse(brp_helper.matches_file_rule(
+                candidate, "/usr/lib64/libvirt*.so", root))
+            self.assertTrue(brp_helper.matches_file_rule(
+                candidate, "/usr/lib64/libvirt/connection-driver/", root))
+            self.assertTrue(brp_helper.matches_file_rule(
+                candidate, "/usr/lib64/libvirt/*", root))
+
+    def test_owner_inference_preserves_multiple_rpm_owners(self):
+        rules = [("%{name}", "/usr/bin/*"), ("%{name}-tools", "/usr/bin/fixture")]
+        for ordered in (rules, list(reversed(rules))):
+            self.assertEqual(plugin.infer_package_owner(
                 ["/usr/bin/fixture"],
-                [("%{name}", "/usr/bin/fixture"), ("%{name}-tools", "/usr/bin/fixture")],
-            )
+                ordered,
+            ), ["%{name}", "%{name}-tools"])
+
+    def test_equal_specificity_owner_collision_is_preserved(self):
+        self.assertEqual(plugin.infer_package_owner(
+            ["/usr/bin/fixture"],
+            [("%{name}", "/usr/bin/fixture"), ("%{name}-tools", "/usr/bin/fixture")],
+        ), ["%{name}", "%{name}-tools"])
+
+    def test_brp_owner_sharing_preserves_exclusions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            buildroot = root / "buildroot"
+            specparts = root / "specparts"
+            specparts.mkdir()
+            for name in ("usr/bin/virt-admin", "usr/lib/llvmir-bin/virt-admin"):
+                path = buildroot / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture")
+            config = root / "rules.json"
+            exact = {"package": "client", "path": "/usr/bin/virt-admin", "manifest": False}
+            wildcard = {"package": "others", "path": "/usr/bin/virt*", "manifest": False}
+            cases = [
+                ([exact, wildcard], ["client", "others"], None),
+                ([wildcard, exact], ["client", "others"], None),
+                ([wildcard, exact, dict(exact, exclude=True)], ["others"], None),
+            ]
+            with mock.patch.dict(os.environ, {
+                "RPM_BUILD_ROOT": str(buildroot), "RPM_SPECPARTS_DIR": str(specparts),
+                "RPM_BUILD_DIR": str(root), "RPM_PACKAGE_NAME": "fixture",
+            }), mock.patch.object(sys, "argv", [str(BRP_HELPER_PATH), str(config)]), \
+                    mock.patch.object(brp_helper, "sync_meson_llvmir"):
+                for rules, owner, error in cases:
+                    with self.subTest(rules=rules):
+                        config.write_text(json.dumps({"rules": rules, "package_suffix": "-llvmir"}))
+                        if error:
+                            with self.assertRaisesRegex(RuntimeError, error):
+                                brp_helper.main()
+                        else:
+                            brp_helper.main()
+                            specpart = (specparts / "llvmir.specpart").read_text()
+                            for package in owner:
+                                self.assertIn("%package -n " + package + "-llvmir", specpart)
+                            self.assertEqual(specpart.count("%package -n "), len(owner))
 
     def test_relative_files_manifest_is_parsed_as_an_owner_rule(self):
         rules = plugin._files_section_rules("""Name: fixture
@@ -427,13 +486,26 @@ printf executable > %{buildroot}/usr/bin/fixture
 printf library > %{buildroot}/usr/lib64/libfixture.so.1
 mkdir -p %{buildroot}/usr/lib/llvmir-bin %{buildroot}/usr/lib/llvmir
 printf executable-ir > %{buildroot}/usr/lib/llvmir-bin/fixture
+printf '{ exported; };' > %{buildroot}/usr/lib/llvmir-bin/fixture_dynamiclist
 printf library-ir > %{buildroot}/usr/lib/llvmir/libfixture.so.1
+printf '{ exported; };' > %{buildroot}/usr/lib/llvmir/libfixture.so.1_dynamiclist
+mkdir -p %{buildroot}/usr/lib/llvmir/asm
+printf assembly > %{buildroot}/usr/lib/llvmir/asm/hash-trampoline.S.o
+printf "cmd=( './asm/hash-trampoline.S.o' './libfixture.so.1' )\n" > %{buildroot}/usr/lib/llvmir/libfixture.so.1_cmd
+mkdir -p %{buildroot}/usr/lib64/fixture/llvmir
+printf plugin > %{buildroot}/usr/lib64/fixture/plugin.so
+printf plugin-ir > %{buildroot}/usr/lib64/fixture/llvmir/plugin.so
 
 %files
 /usr/bin/fixture
+/usr/lib64/fixture/
+%exclude /usr/lib64/fixture/plugin.so
+%exclude /usr/lib64/fixture/llvmir
 
 %files libs
 /usr/lib64/libfixture.so.*
+/usr/lib64/fixture/
+%exclude /usr/lib64/fixture/llvmir
 
 %changelog
 * Thu Jan 01 2026 Test <test@example.invalid> - 1-1
@@ -452,6 +524,17 @@ Initial fixture
             self.assertIn("fixture-libs-llvmir", by_name)
             self.assertIn("/usr/lib/llvmir-bin/fixture", plugin.package_filelist(by_name["fixture-llvmir"]))
             self.assertIn("/usr/lib/llvmir/libfixture.so.1", plugin.package_filelist(by_name["fixture-libs-llvmir"]))
+            self.assertEqual(plugin.package_filelist(by_name["fixture-llvmir"]), [
+                "/usr/lib/llvmir-bin/fixture",
+                "/usr/lib/llvmir-bin/fixture_dynamiclist",
+            ])
+            self.assertEqual(plugin.package_filelist(by_name["fixture-libs-llvmir"]), [
+                "/usr/lib/llvmir/asm/hash-trampoline.S.o",
+                "/usr/lib/llvmir/libfixture.so.1",
+                "/usr/lib/llvmir/libfixture.so.1_cmd",
+                "/usr/lib/llvmir/libfixture.so.1_dynamiclist",
+                "/usr/lib64/fixture/llvmir/plugin.so",
+            ])
             fixture_requires = subprocess.run(
                 ["rpm", "-qp", "--requires", str(by_name["fixture-llvmir"])],
                 check=True, capture_output=True, text=True,
@@ -474,7 +557,236 @@ Initial fixture
             self.assertIn("(fixture-libs and llvmir-converter)", libs_supplements)
 
     @unittest.skipUnless(shutil.which("rpmbuild"), "rpmbuild is required")
-    def test_rpmbuild_fails_for_ambiguous_ir_owner(self):
+    def test_rpmbuild_removes_ir_for_deleted_native_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            topdir = Path(temp) / "rpmbuild"
+            for directory in ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"):
+                (topdir / directory).mkdir(parents=True)
+            spec_path = topdir / "SPECS" / "fixture.spec"
+            spec_path.write_text("""Name: fixture
+Version: 1
+Release: 1
+Summary: Removed native files fixture
+License: MIT
+
+%description
+fixture
+
+%install
+mkdir -p %{buildroot}/usr/lib64/llvmir
+printf native > %{buildroot}/usr/lib64/libkeep.a
+for name in libkeep.a libremoved.a libremoved.a.bc libremoved.a_cmd libremoved.a_log libremoved.a_missing; do
+    printf ir > %{buildroot}/usr/lib64/llvmir/$name
+done
+printf native > %{buildroot}/usr/lib64/libremoved.a
+rm %{buildroot}/usr/lib64/libremoved.a
+for pair in 'bin tjbench' 'sbin removed-admin' 'libexec removed-helper'; do
+    set -- $pair
+    mkdir -p %{buildroot}/usr/$1 %{buildroot}/usr/lib/llvmir-$1/asm
+    printf native > %{buildroot}/usr/$1/$2
+    for suffix in '' .bc _cmd _verscript _dynamiclist .version.txt .soversion.txt _log _missing .bc_log .bc_missing _cmd_log; do
+        printf ir > %{buildroot}/usr/lib/llvmir-$1/$2$suffix
+    done
+    printf './asm/removed.o' > %{buildroot}/usr/lib/llvmir-$1/$2_cmd
+    printf assembly > %{buildroot}/usr/lib/llvmir-$1/asm/removed.o
+    rm %{buildroot}/usr/$1/$2
+done
+for suffix in .bc _cmd _verscript _dynamiclist .version.txt .soversion.txt _log _missing; do
+    printf ir > %{buildroot}/usr/lib64/llvmir/libremoved.so.1$suffix
+done
+
+%files
+/usr/lib64/libkeep.a
+
+%changelog
+* Thu Jan 01 2026 Test <test@example.invalid> - 1-1
+Initial fixture
+""")
+            build = subprocess.run(
+                self.hook_build_command(topdir, spec_path),
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            ir_rpm = next(rpm for rpm in (topdir / "RPMS").rglob("*.rpm")
+                          if plugin.parse_nevra(rpm)[0] == "fixture-llvmir")
+            self.assertEqual(
+                plugin.package_filelist(ir_rpm), ["/usr/lib64/llvmir/libkeep.a"],
+            )
+
+    def test_rpmbuild_omits_ir_for_excluded_static_library(self):
+        with tempfile.TemporaryDirectory() as temp:
+            topdir = Path(temp) / "rpmbuild"
+            for directory in ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"):
+                (topdir / directory).mkdir(parents=True)
+            spec_path = topdir / "SPECS" / "fixture.spec"
+            spec_path.write_text("""Name: fixture
+Version: 1
+Release: 1
+Summary: Excluded static library fixture
+License: MIT
+
+%description
+fixture
+
+%install
+mkdir -p %{buildroot}/usr/lib64/llvmir
+printf native > %{buildroot}/usr/lib64/libfixture.a
+printf ir > %{buildroot}/usr/lib64/llvmir/libfixture.a
+printf native > %{buildroot}/usr/lib64/libfixture.so.1
+printf ir > %{buildroot}/usr/lib64/llvmir/libfixture.so.1
+
+%files
+/usr/lib64/libfixture.so.1
+%exclude /usr/lib64/libfixture.a
+
+%changelog
+* Thu Jan 01 2026 Test <test@example.invalid> - 1-1
+Initial fixture
+""")
+            build = subprocess.run(
+                self.hook_build_command(topdir, spec_path),
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            ir_rpm = next(rpm for rpm in (topdir / "RPMS").rglob("*.rpm")
+                          if plugin.parse_nevra(rpm)[0] == "fixture-llvmir")
+            self.assertEqual(plugin.package_filelist(ir_rpm),
+                             ["/usr/lib64/llvmir/libfixture.so.1"])
+
+    def test_brp_preserves_executable_installation_prefix(self):
+        cases = [
+            ("/usr/lib/llvmir-convert", "lib", "bin"),
+            ("/usr/lib/llvmir-convert", "lib", "sbin"),
+            ("/usr/lib/llvmir-convert", "lib", "libexec"),
+            ("/usr/lib64/vendor", "lib64", "bin"),
+            ("/usr", "lib64", "bin"),
+            ("/usr", "lib", "bin"),
+            ("/usr", "lib", "sbin"),
+            ("/usr", "lib", "libexec"),
+        ]
+        for prefix, libdir, directory in cases:
+            with self.subTest(prefix=prefix, libdir=libdir, directory=directory), \
+                 tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                buildroot = root / "buildroot"
+                specparts = root / "specparts"
+                specparts.mkdir()
+                native = prefix + "/" + directory + "/llvmir-converter-22"
+                path = buildroot / native.lstrip("/")
+                path.parent.mkdir(parents=True)
+                path.write_text("native")
+                ir_dir = prefix + "/" + libdir + "/llvmir-" + directory
+                ir = buildroot / ir_dir.lstrip("/")
+                ir.mkdir(parents=True)
+                artifacts = ["llvmir-converter-22", "llvmir-converter-22.bc",
+                             "llvmir-converter-22_cmd"]
+                for name in artifacts:
+                    (ir / name).write_text("bitcode")
+                rules = [{"package": "fixture", "path": native, "manifest": False}]
+                if prefix not in ("", "/usr"):
+                    # A same-named system program must not claim private IR.
+                    system = "/usr/" + directory + "/llvmir-converter-22"
+                    path = buildroot / system.lstrip("/")
+                    path.parent.mkdir(parents=True)
+                    path.write_text("unrelated native")
+                    rules.append({"package": "unrelated", "path": system,
+                                  "manifest": False})
+                config = root / "rules.json"
+                config.write_text(json.dumps({"rules": rules, "package_suffix": "-llvmir"}))
+                environment = {"RPM_BUILD_ROOT": str(buildroot),
+                               "RPM_SPECPARTS_DIR": str(specparts),
+                               "RPM_BUILD_DIR": str(root), "RPM_PACKAGE_NAME": "fixture"}
+                with mock.patch.dict(os.environ, environment), \
+                     mock.patch.object(sys, "argv", [str(BRP_HELPER_PATH), str(config)]), \
+                     mock.patch.object(brp_helper, "sync_meson_llvmir"):
+                    brp_helper.main()
+                self.assertEqual(
+                    (specparts / "llvmir-files-0.list").read_text().splitlines(),
+                    sorted(ir_dir + "/" + name for name in artifacts),
+                )
+                self.assertFalse((specparts / "llvmir-files-1.list").exists())
+                self.assertIn("%package -n fixture-llvmir",
+                              (specparts / "llvmir.specpart").read_text())
+
+    @unittest.skipUnless(shutil.which("rpmbuild"), "rpmbuild is required")
+    def test_rpmbuild_maps_private_bin_ir_to_package(self):
+        with tempfile.TemporaryDirectory() as temp:
+            topdir = Path(temp) / "rpmbuild"
+            for directory in ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"):
+                (topdir / directory).mkdir(parents=True)
+            spec_path = topdir / "SPECS" / "fixture.spec"
+            spec_path.write_text("""Name: fixture
+Version: 1
+Release: 1
+Summary: Private executable directory fixture
+License: MIT
+
+%description
+fixture
+
+%install
+mkdir -p %{buildroot}/usr/lib/llvmir-convert/bin
+mkdir -p %{buildroot}/usr/lib/llvmir-convert/lib/llvmir-bin
+printf native > %{buildroot}/usr/lib/llvmir-convert/bin/llvmir-converter-22
+printf bitcode > %{buildroot}/usr/lib/llvmir-convert/lib/llvmir-bin/llvmir-converter-22
+printf command > %{buildroot}/usr/lib/llvmir-convert/lib/llvmir-bin/llvmir-converter-22_cmd
+
+%files
+/usr/lib/llvmir-convert/bin/llvmir-converter-*
+""")
+            build = subprocess.run(
+                self.hook_build_command(topdir, spec_path),
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            ir_rpm = next(rpm for rpm in (topdir / "RPMS").rglob("*.rpm")
+                          if plugin.parse_nevra(rpm)[0] == "fixture-llvmir")
+            self.assertEqual(plugin.package_filelist(ir_rpm), [
+                "/usr/lib/llvmir-convert/lib/llvmir-bin/llvmir-converter-22",
+                "/usr/lib/llvmir-convert/lib/llvmir-bin/llvmir-converter-22_cmd",
+            ])
+
+    def test_assembly_inputs_follow_all_consuming_packages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            buildroot = root / "buildroot"
+            specparts = root / "specparts"
+            specparts.mkdir()
+            ir = buildroot / "usr/lib64/llvmir"
+            (ir / "asm").mkdir(parents=True)
+            (ir / "asm/shared-object.o").write_text("assembly")
+            rules = []
+            for name in ("first", "second"):
+                (buildroot / ("usr/lib64/lib%s.so.1" % name)).write_text("native")
+                (ir / ("lib%s.so.1.bc" % name)).write_text("bitcode")
+                (ir / ("lib%s.so.1_cmd" % name)).write_text(
+                    "# ./asm/comment-only.o\ncmd=(\n  './asm/shared-object.o'\n)\n"
+                )
+                rules.append({"package": name, "path": "/usr/lib64/lib%s.so.1" % name,
+                              "manifest": False})
+            config = root / "rules.json"
+            config.write_text(json.dumps({"rules": rules, "package_suffix": "-llvmir"}))
+            environment = {"RPM_BUILD_ROOT": str(buildroot),
+                           "RPM_SPECPARTS_DIR": str(specparts),
+                           "RPM_BUILD_DIR": str(root), "RPM_PACKAGE_NAME": "fixture"}
+            with mock.patch.dict(os.environ, environment), \
+                 mock.patch.object(sys, "argv", [str(BRP_HELPER_PATH), str(config)]), \
+                 mock.patch.object(brp_helper, "sync_meson_llvmir"):
+                brp_helper.main()
+                for index in range(2):
+                    self.assertIn("/usr/lib64/llvmir/asm/shared-object.o",
+                                  (specparts / ("llvmir-files-%d.list" % index)).read_text())
+                (ir / "asm/shared-object.o").unlink()
+                with self.assertRaisesRegex(RuntimeError, "missing assembly input"):
+                    brp_helper.main()
+                (ir / "asm/shared-object.o").write_text("assembly")
+                (ir / "asm/orphan.o").write_text("orphan")
+                brp_helper.main()
+                self.assertFalse((ir / "asm/orphan.o").exists())
+                self.assertTrue((ir / "asm/shared-object.o").exists())
+
+    @unittest.skipUnless(shutil.which("rpmbuild"), "rpmbuild is required")
+    def test_rpmbuild_preserves_multiple_ir_owners(self):
         with tempfile.TemporaryDirectory() as temp:
             topdir = Path(temp) / "rpmbuild"
             for directory in ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"):
@@ -514,8 +826,13 @@ Initial fixture
                 self.hook_build_command(topdir, spec_path),
                 capture_output=True, text=True, timeout=60,
             )
-            self.assertNotEqual(build.returncode, 0)
-            self.assertIn("ambiguous %files owner", build.stdout + build.stderr)
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            by_name = {plugin.parse_nevra(rpm)[0]: rpm
+                       for rpm in (topdir / "RPMS").rglob("*.rpm")}
+            self.assertEqual(plugin.package_filelist(by_name["ambiguous-llvmir"]),
+                             ["/usr/lib/llvmir-bin/app"])
+            self.assertEqual(plugin.package_filelist(by_name["ambiguous-tools-llvmir"]),
+                             ["/usr/lib/llvmir-bin/app"])
 
     @unittest.skipUnless(shutil.which("rpmbuild"), "rpmbuild is required")
     def test_rpmbuild_only_creates_subpackage_when_ir_exists(self):

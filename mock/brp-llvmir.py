@@ -5,6 +5,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -149,6 +150,21 @@ def package_name(package):
     return package.replace("%{name}", os.environ["RPM_PACKAGE_NAME"])
 
 
+def matches_file_rule(candidate, pattern, buildroot):
+    """Match path components, including descendants of matched directories."""
+    pattern_parts = pattern.rstrip("/").split("/")
+    candidate_parts = candidate.split("/")
+    if len(candidate_parts) < len(pattern_parts):
+        return False
+    if not all(fnmatch.fnmatchcase(value, glob)
+               for value, glob in zip(candidate_parts, pattern_parts)):
+        return False
+    if len(candidate_parts) == len(pattern_parts):
+        return True
+    directory = "/".join(candidate_parts[:len(pattern_parts)])
+    return (buildroot / directory.lstrip("/")).is_dir()
+
+
 def main():
     sync_meson_llvmir()
 
@@ -169,18 +185,21 @@ def main():
         re.search(r"/llvmir(?:-bin|-sbin|-libexec)?/", path.as_posix()) and
         not path.name.endswith(("_log", "_missing"))
     )
+    assembly_paths = {path.resolve(): path for path in ir_paths
+                      if "/asm/" in path.relative_to(buildroot).as_posix()}
+    script_owners = {}
 
     for path in ir_paths:
+        if path.resolve() in assembly_paths:
+            continue
         relative = "/" + path.relative_to(buildroot).as_posix()
         ir_match = re.search(r"/(llvmir(?:-bin|-sbin|-libexec)?)/(.*)$", relative)
         kind, artifact = ir_match.groups()
         base = artifact.rsplit("/", 1)[-1]
-        for suffix in ("_cmd", "_verscript", ".version.txt", ".soversion.txt", ".bc"):
+        for suffix in ("_cmd", "_verscript", "_dynamiclist", ".version.txt", ".soversion.txt", ".bc"):
             if base.endswith(suffix):
                 base = base[:-len(suffix)]
                 break
-        if "/asm/" in relative:
-            base = base.split("-", 1)[-1]
 
         if kind == "llvmir":
             ir_prefix = relative.split("/llvmir/", 1)[0]
@@ -188,19 +207,34 @@ def main():
             if not (buildroot / candidates[0].lstrip("/")).exists():
                 candidates.extend(("/usr/lib64/" + base, "/usr/lib/" + base,
                                    "/lib64/" + base, "/lib/" + base))
-        elif kind == "llvmir-bin":
-            candidates = ["/usr/bin/" + base, "/bin/" + base]
-        elif kind == "llvmir-sbin":
-            candidates = ["/usr/sbin/" + base, "/sbin/" + base]
         else:
-            candidates = ["/usr/libexec/" + base]
+            # The install wrapper stores <prefix>/bin sidecars under
+            # <prefix>/lib/llvmir-bin, including private installation prefixes.
+            ir_prefix = relative[:ir_match.start()]
+            prefix = re.sub(r"/lib(?:64)?$", "", ir_prefix)
+            directory = kind.removeprefix("llvmir-")
+            candidates = [prefix + "/" + directory + "/" + base]
+            if prefix in ("", "/usr"):
+                if directory in ("bin", "sbin"):
+                    candidates = ["/usr/" + directory + "/" + base,
+                                  "/" + directory + "/" + base]
+                else:
+                    candidates = ["/usr/libexec/" + base]
 
         candidates = [candidate for candidate in candidates
                       if (buildroot / candidate.lstrip("/")).exists()]
         if not candidates:
-            raise RuntimeError("no installed native file for %s" % relative)
+            # Specs may remove installed programs or libraries while leaving
+            # the IR copied by the install wrapper behind.
+            print("Removing LLVM IR for absent native file: %s" % relative)
+            path.unlink()
+            for suffix in ("_log", "_missing"):
+                path.with_name(path.name + suffix).unlink(missing_ok=True)
+                path.with_name(base + suffix).unlink(missing_ok=True)
+            continue
 
         owners = set()
+        excluded_owners = set()
         for index, rule in enumerate(rules):
             if rule["manifest"]:
                 manifest = rule["path"]
@@ -217,19 +251,59 @@ def main():
             else:
                 patterns = [rule["path"]]
             for pattern in patterns:
+                excluded = rule.get("exclude", False) or pattern.startswith("%exclude ")
+                if pattern.startswith("%exclude "):
+                    pattern = pattern[len("%exclude "):].strip()
                 pattern = expand_rpm_path(pattern)
                 for expanded_pattern in expand_braces(pattern):
                     for candidate in candidates:
-                        if fnmatch.fnmatchcase(candidate, expanded_pattern):
-                            owners.add(rule["package"])
+                        if matches_file_rule(candidate, expanded_pattern, buildroot):
+                            if excluded:
+                                excluded_owners.add(rule["package"])
+                            else:
+                                owners.add(rule["package"])
+        owners.difference_update(excluded_owners)
 
         if not owners:
+            if excluded_owners:
+                # RPM deliberately omits this native file from the package.
+                # Its IR sidecar must be omitted as well; an explicit
+                # %exclude is different from an unowned installed file.
+                print("Removing excluded LLVM IR artifact: %s" % relative)
+                path.unlink()
+                for suffix in ("_log", "_missing"):
+                    path.with_name(path.name + suffix).unlink(missing_ok=True)
+                continue
             raise RuntimeError(f"no %files owner matches {relative}")
-        if len(owners) != 1:
-            raise RuntimeError(
-                f"ambiguous %files owner for {relative}: {', '.join(sorted(owners))}"
-            )
-        files_by_owner[owners.pop()].append(relative)
+        for owner in owners:
+            files_by_owner[owner].append(relative)
+        if path.name.endswith("_cmd"):
+            script_owners[path] = owners
+
+    # Native assembly inputs belong to the products whose relink scripts use
+    # them, rather than to an independently installed native object. A shared
+    # input must be included in every consuming IR package.
+    assembly_owners = {path: set() for path in assembly_paths}
+    for script, owners in script_owners.items():
+        tokens = shlex.shlex(script.read_text(encoding="utf-8"), posix=True)
+        tokens.whitespace_split = True
+        for token in tokens:
+            if not token.startswith(("./asm/", "asm/")):
+                continue
+            reference = (script.parent / token).resolve()
+            if reference not in assembly_paths:
+                raise RuntimeError(f"missing assembly input {token} referenced by {script}")
+            assembly_owners[reference].update(owners)
+    for resolved, path in assembly_paths.items():
+        relative = "/" + path.relative_to(buildroot).as_posix()
+        if not assembly_owners[resolved]:
+            print("Removing unused LLVM IR assembly input: %s" % relative)
+            path.unlink()
+            for suffix in ("_log", "_missing"):
+                path.with_name(path.name + suffix).unlink(missing_ok=True)
+            continue
+        for owner in assembly_owners[resolved]:
+            files_by_owner[owner].append(relative)
 
     specpart = specparts / "llvmir.specpart"
     with specpart.open("w", encoding="utf-8") as output:

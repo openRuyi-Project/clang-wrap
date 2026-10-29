@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
 project(LLVMIRSelectionFixture LANGUAGES C CXX ASM)
 
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/pymain.c" "This is a non-compiled CMake support file.\n")
+add_custom_target(support_files SOURCES "${CMAKE_CURRENT_BINARY_DIR}/pymain.c")
+
 add_executable(selected_app selected.c)
 target_compile_definitions(selected_app PRIVATE FIXTURE_COMPILE_DATABASE=1)
 set_source_files_properties(selected.c PROPERTIES COMPILE_OPTIONS "-DFIXTURE_PER_SOURCE_OPTION=1")
