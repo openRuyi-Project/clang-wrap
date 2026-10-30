@@ -51,6 +51,9 @@ set(_nested_bc "${TEST_OUTPUT_DIR}/nested/nested_cpp.bc")
 set(_object_bc "${TEST_OUTPUT_DIR}/object_app.bc")
 set(_same_stem_archive "${TEST_OUTPUT_DIR}/same_stem_output.archive")
 set(_linked_bc "${TEST_OUTPUT_DIR}/linked_app.bc")
+set(_duplicate_linked_bc "${TEST_OUTPUT_DIR}/duplicate_linked_app.bc")
+set(_duplicate_one_archive "${TEST_OUTPUT_DIR}/duplicate_one/libduplicate_one_lib.a")
+set(_duplicate_two_archive "${TEST_OUTPUT_DIR}/duplicate_two/libduplicate_two_lib.a")
 set(_interface_linked_bc "${TEST_OUTPUT_DIR}/interface_linked_app.bc")
 set(_forward_linked_bc "${TEST_OUTPUT_DIR}/forward_linked_app.bc")
 set(_generated_source_bc "${TEST_OUTPUT_DIR}/generated_source_app.bc")
@@ -71,6 +74,8 @@ endif()
 if(CASE_MODE STREQUAL "ON")
   if(NOT EXISTS "${_selected_bc}" OR NOT EXISTS "${_unselected_bc}" OR NOT EXISTS "${_nested_bc}" OR
      NOT EXISTS "${_object_bc}" OR NOT EXISTS "${_same_stem_archive}" OR NOT EXISTS "${_linked_bc}" OR
+     NOT EXISTS "${_duplicate_linked_bc}" OR NOT EXISTS "${_duplicate_one_archive}" OR
+     NOT EXISTS "${_duplicate_two_archive}" OR
      NOT EXISTS "${_interface_linked_bc}" OR NOT EXISTS "${_forward_linked_bc}" OR NOT EXISTS "${_generated_source_bc}" OR NOT EXISTS "${_cycle_bc}" OR
      NOT EXISTS "${_lib_prefixed_bc}" OR NOT EXISTS "${_custom_suffix_bc}" OR NOT EXISTS "${_zero_soversion_bc}" OR NOT EXISTS "${_whole_archive_bc}" OR NOT EXISTS "${_external_archive_bc}")
     message(FATAL_ERROR "Enabled mode did not generate all expected fixture artifacts.")
@@ -136,6 +141,7 @@ if(CASE_MODE STREQUAL "ON")
       NOT EXISTS "${_install_prefix}/lib/llvmir/libxlinker_versioned_shared.so.3_verscript" OR
       NOT EXISTS "${_install_prefix}/lib/llvmir/libasm_static.a" OR
       NOT EXISTS "${_install_prefix}/lib/llvmir/libembedded_static.a" OR
+      NOT EXISTS "${_install_prefix}/lib/llvmir/libduplicate_one_lib.a" OR
       NOT EXISTS "${_install_prefix}/lib/llvmir-bin/asm_static_app_cmd")
     message(FATAL_ERROR "LLVM IR component installation omitted expected artifacts.")
   endif()
@@ -340,6 +346,16 @@ if(CASE_MODE STREQUAL "ON")
   )
   if(NOT _linked_relink_result EQUAL 0 OR NOT EXISTS "${_install_prefix}/lib/llvmir-bin/output/linked_app")
     message(FATAL_ERROR "Static-library relink script failed:\n${_linked_relink_error}")
+  endif()
+  execute_process(
+    COMMAND bash ./duplicate_linked_app_cmd
+    WORKING_DIRECTORY "${_install_prefix}/lib/llvmir-bin"
+    RESULT_VARIABLE _duplicate_linked_relink_result
+    ERROR_VARIABLE _duplicate_linked_relink_error
+  )
+  if(NOT _duplicate_linked_relink_result EQUAL 0 OR
+     NOT EXISTS "${_install_prefix}/lib/llvmir-bin/output/duplicate_linked_app")
+    message(FATAL_ERROR "Duplicated-source-directory static-library relink script failed:\n${_duplicate_linked_relink_error}")
   endif()
   execute_process(
     COMMAND bash ./interface_linked_app_cmd

@@ -62,6 +62,77 @@ define_property(GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_INSTALLED_TARGETS
   FULL_DOCS "List of targets that have install() rules defined"
 )
 
+# Global property to store every target created while emission is enabled.
+# Walking DIRECTORY SUBDIRECTORIES cannot distinguish two add_subdirectory()
+# calls that reuse the same source directory with different binary directories
+# (libyang does this for its yangupdate tests), so record targets at creation
+# time instead.
+define_property(GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_TARGETS
+  BRIEF_DOCS "Targets created with add_library()/add_executable()"
+  FULL_DOCS "List of targets registered for LLVM IR processing"
+)
+
+function(_cmake_emit_llvmir_register_target target)
+  if(NOT CMAKE_EMIT_LLVMIR_ENABLED)
+    return()
+  endif()
+  if(NOT TARGET "${target}")
+    return()
+  endif()
+  # Imported and alias targets are not built by this project. Imported
+  # targets are directory-scoped, so they may also be invisible from the
+  # top-level deferred processing pass.
+  get_target_property(_aliased_target "${target}" ALIASED_TARGET)
+  if(_aliased_target)
+    return()
+  endif()
+  get_target_property(_imported_target "${target}" IMPORTED)
+  if(_imported_target)
+    return()
+  endif()
+  get_property(_targets GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_TARGETS)
+  list(APPEND _targets "${target}")
+  list(REMOVE_DUPLICATES _targets)
+  set_property(GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_TARGETS "${_targets}")
+endfunction()
+
+# Wrap target creation commands so that all targets are visible to the
+# deferred processing pass, even when a project adds the same source
+# directory more than once with different binary directories.
+function(add_library target)
+  # Read ARGV by index: expanding ARGN would split escaped semicolons and
+  # drop empty arguments. Bracket arguments also avoid a second expansion.
+  set(_target_call "")
+  math(EXPR _last_argument "${ARGC} - 1")
+  foreach(_index RANGE 0 ${_last_argument})
+    set(_argument "${ARGV${_index}}")
+    set(_delimiter "=")
+    while(_argument MATCHES "\\]${_delimiter}\\]")
+      string(APPEND _delimiter "=")
+    endwhile()
+    string(APPEND _target_call " [${_delimiter}[${_argument}]${_delimiter}]")
+  endforeach()
+  cmake_language(EVAL CODE "_add_library(${_target_call})")
+  _cmake_emit_llvmir_register_target("${target}")
+endfunction()
+
+function(add_executable target)
+  # Read ARGV by index: expanding ARGN would split escaped semicolons and
+  # drop empty arguments. Bracket arguments also avoid a second expansion.
+  set(_target_call "")
+  math(EXPR _last_argument "${ARGC} - 1")
+  foreach(_index RANGE 0 ${_last_argument})
+    set(_argument "${ARGV${_index}}")
+    set(_delimiter "=")
+    while(_argument MATCHES "\\]${_delimiter}\\]")
+      string(APPEND _delimiter "=")
+    endwhile()
+    string(APPEND _target_call " [${_delimiter}[${_argument}]${_delimiter}]")
+  endforeach()
+  cmake_language(EVAL CODE "_add_executable(${_target_call})")
+  _cmake_emit_llvmir_register_target("${target}")
+endfunction()
+
 # Wrapper function to track install() calls for targets
 # This allows us to only install LLVM IR for targets that have install rules
 function(install)
@@ -149,10 +220,12 @@ function(install)
   # Forward every argument as an explicitly quoted argument. In particular,
   # this preserves empty PATTERN/REGEX values used by projects such as MariaDB;
   # an unquoted ${ARGN} drops empty list elements and turns `PATTERN "" EXCLUDE`
-  # into `PATTERN EXCLUDE`.
+  # into `PATTERN EXCLUDE`. Escape '$' as well so install(CODE) strings keep
+  # their install-time variable references instead of expanding them in EVAL.
   set(_install_call "")
   foreach(_argument IN LISTS ARGN)
     string(REPLACE "\\" "\\\\" _escaped_argument "${_argument}")
+    string(REPLACE "$" "\\$" _escaped_argument "${_escaped_argument}")
     string(REPLACE "\"" "\\\"" _escaped_argument "${_escaped_argument}")
     string(APPEND _install_call " \"${_escaped_argument}\"")
   endforeach()
@@ -863,6 +936,17 @@ function(cmake_emit_llvmir_process_target target)
     return()
   endif()
 
+  # Alias targets only forward to an already registered target, and imported
+  # targets are not built by this project.
+  get_target_property(_aliased_target ${target} ALIASED_TARGET)
+  if(_aliased_target)
+    return()
+  endif()
+  get_target_property(_imported_target ${target} IMPORTED)
+  if(_imported_target)
+    return()
+  endif()
+
   get_target_property(_target_type ${target} TYPE)
   get_target_property(_target_name ${target} NAME)
   get_target_property(_target_sources ${target} SOURCES)
@@ -1534,16 +1618,32 @@ function(_cmake_emit_llvmir_process_all_targets)
   message(STATUS "  Install directory: ${CMAKE_EMIT_LLVMIR_INSTALL_DIR}")
   _cmake_emit_llvmir_collect_directory_targets(${CMAKE_SOURCE_DIR} _all_targets)
 
+  # Prefer the creation-time registry.  The directory walk is retained as a
+  # fallback for targets that existed before a manual include(CMakeEmitLLVMIR).
+  get_property(_registered_targets GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_TARGETS)
+  foreach(_target IN LISTS _registered_targets)
+    if(NOT _target IN_LIST _all_targets)
+      list(APPEND _all_targets "${_target}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES _all_targets)
+
   # Register every static library before a consumer can compute its merged
   # bitcode as an input. This makes each static-library .bc file have exactly
   # one custom-command producer under parallel Make builds.
   foreach(_target IN LISTS _all_targets)
+    if(NOT TARGET "${_target}")
+      continue()
+    endif()
     get_target_property(_target_type ${_target} TYPE)
     if(_target_type STREQUAL "STATIC_LIBRARY")
       cmake_emit_llvmir_process_target(${_target})
     endif()
   endforeach()
   foreach(_target IN LISTS _all_targets)
+    if(NOT TARGET "${_target}")
+      continue()
+    endif()
     get_target_property(_target_type ${_target} TYPE)
     if(NOT _target_type STREQUAL "STATIC_LIBRARY")
       cmake_emit_llvmir_process_target(${_target})

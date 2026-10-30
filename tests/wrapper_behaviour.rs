@@ -114,6 +114,81 @@ fn command_exists(command: &str) -> bool {
 }
 
 #[test]
+fn object_suffixes_relink_without_build_tree_objects() {
+    if !command_exists("clang") || !command_exists("llvm-link") {
+        eprintln!("skipping object suffix test: clang or llvm-link is unavailable");
+        return;
+    }
+
+    for (suffix, helper_object, native_helper) in [
+        ("os", "helper.os", false),
+        ("lo", "helper.os", false),
+        ("o", "helper.os", true),
+        ("o", "helper.obj", true),
+    ] {
+        let test_dir = TestDir::new();
+        let root = test_dir.path();
+        let llvmir_dir = root.join("llvmir");
+        write_file(
+            &root.join("main.c"),
+            "int helper(void); int main(void) { return helper(); }\n",
+        );
+        write_file(&root.join("helper.c"), "int helper(void) { return 0; }\n");
+        let main_object = format!("main.{suffix}");
+        for (source, object, native) in [
+            ("main.c", main_object.as_str(), false),
+            ("helper.c", helper_object, native_helper),
+        ] {
+            let status = Command::new(if native { "clang" } else { bin("clang") })
+                .current_dir(root)
+                .env("EMIT_LLVMIR", "1")
+                .env("LLVM_IR_DIR", &llvmir_dir)
+                .args(["-c", source, "-o", object])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let status = Command::new(bin("clang"))
+            .current_dir(root)
+            .env("EMIT_LLVMIR", "1")
+            .env("LLVM_IR_DIR", &llvmir_dir)
+            .args([main_object.as_str(), helper_object, "-o", "app"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let installed = root.join("image/usr/bin");
+        fs::create_dir_all(&installed).unwrap();
+        run_wrapper("install", root, &llvmir_dir, &["app", "image/usr/bin/app"]);
+        fs::remove_file(root.join(&main_object)).unwrap();
+        if helper_object != "helper.obj" {
+            fs::remove_file(root.join(helper_object)).unwrap();
+        } else {
+            // Unknown suffixes remain explicit inputs; keep one available to
+            // verify that -x ir does not leak onto a native object.
+            fs::copy(
+                root.join(helper_object),
+                root.join("image/usr/lib/llvmir-bin").join(helper_object),
+            )
+            .unwrap();
+        }
+        let relink_dir = root.join("image/usr/lib/llvmir-bin");
+        let status = Command::new("bash")
+            .current_dir(&relink_dir)
+            .arg("app_cmd")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "relink failed for {suffix}, native={native_helper}"
+        );
+        assert!(Command::new(relink_dir.join("output/app"))
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+#[test]
 fn versioned_llvm_ar_alias_uses_the_matching_real_tool() {
     let test_dir = TestDir::new();
     let root = test_dir.path();

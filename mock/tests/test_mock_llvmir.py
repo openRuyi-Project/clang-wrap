@@ -366,6 +366,18 @@ fixture
         self.assertIn(("%{name}-libs", "%{_libdir}/libfixture.so.*"), rules)
         self.assertIn(("%{name}-libs", "%{_sysconfdir}/fixture.conf"), rules)
 
+    def test_files_manifest_argument_is_not_treated_as_subpackage_name(self):
+        rules = plugin._files_section_rules("""Name: gnupg
+%files -f gnupg2.lang
+%{_bindir}/gpg
+%files tools -f tools.lang
+%{_bindir}/gpgconf
+""")
+        self.assertIn(("%{name}", "@manifest@gnupg2.lang"), rules)
+        self.assertIn(("%{name}", "%{_bindir}/gpg"), rules)
+        self.assertIn(("%{name}-tools", "@manifest@tools.lang"), rules)
+        self.assertIn(("%{name}-tools", "%{_bindir}/gpgconf"), rules)
+
     def test_owner_rules_preserve_package_exclusions(self):
         rules = plugin.owner_rule_config(Path("unused.spec"), expanded_text="""Name: fixture
 %files client

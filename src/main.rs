@@ -32,6 +32,10 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     ".c", ".cpp", ".cc", ".cxx", ".c++", ".m", ".mm", ".S", ".s", ".asm",
 ];
 
+fn is_object_input(arg: &str) -> bool {
+    !arg.starts_with('-') && [".o", ".lo", ".os"].iter().any(|ext| arg.ends_with(ext))
+}
+
 /// Get clang version information
 fn get_clang_version(clang_path: &Path) -> Option<String> {
     let output = Command::new(clang_path).arg("--version").output().ok()?;
@@ -1748,28 +1752,32 @@ fn merge_llvm_ir(
                 .and_then(|name| name.to_str())
                 .unwrap_or("llvm-link"),
         );
-        let mut inputs = direct_inputs.to_vec();
+        // Whole-archive members are also inputs to the link and can reference
+        // symbols from regular static archives (elfutils' libasm does this).
+        // Extract them before selecting regular archive members so their
+        // undefined symbols participate in the selection.
+        let mut whole_member_paths = Vec::new();
+        for (index, archive) in whole_archives.iter().enumerate() {
+            let members = extract_archive_members(
+                &llvm_ar,
+                &nm,
+                archive,
+                &work_directory.join(format!("whole-{index}")),
+            )?;
+            whole_member_paths.extend(members.into_iter().map(|member| member.path));
+        }
+        let mut selection_inputs = direct_inputs.to_vec();
+        selection_inputs.extend(whole_member_paths.iter().cloned());
         let (selected_members, _) = select_archive_members(
             &llvm_ar,
             &nm,
             static_archives,
-            direct_inputs,
+            &selection_inputs,
             &work_directory,
         )?;
+        let mut inputs = direct_inputs.to_vec();
         inputs.extend(selected_members);
-        if !whole_archives.is_empty() {
-            let mut whole_members = Vec::new();
-            for (index, archive) in whole_archives.iter().enumerate() {
-                let members = extract_archive_members(
-                    &llvm_ar,
-                    &nm,
-                    archive,
-                    &work_directory.join(format!("whole-{index}")),
-                )?;
-                whole_members.extend(members.into_iter().map(|member| member.path));
-            }
-            inputs.extend(whole_members);
-        }
+        inputs.extend(whole_member_paths);
         run_llvm_link(llvm_link, output, &inputs, false, log_file)?;
         Ok(())
     })();
@@ -1840,7 +1848,7 @@ fn handle_link_command(
                 }
             }
         } else if arg.starts_with("-l") && arg.len() > 2 {
-        } else if arg.ends_with(".o") && !arg.starts_with('-') {
+        } else if is_object_input(arg) {
             object_files.push(PathBuf::from(arg));
         } else if !arg.starts_with('-') && SOURCE_EXTENSIONS.iter().any(|ext| arg.ends_with(ext)) {
             source_files.push(PathBuf::from(arg));
@@ -2575,7 +2583,7 @@ fn generate_link_cmd_file(
         // Keep their native fallback members through _missing/asm, but do not
         // leave the build-tree archive itself in the installed relink script.
         let is_native_input = !arg.starts_with('-')
-            && (arg.ends_with(".o")
+            && (is_object_input(arg)
                 || SOURCE_EXTENSIONS
                     .iter()
                     .any(|extension| arg.ends_with(extension))
@@ -2597,10 +2605,12 @@ fn generate_link_cmd_file(
                 push_array_arg(&mut script, "-x");
                 push_array_arg(&mut script, "ir");
                 push_array_arg(&mut script, &format!("./{bc_filename}"));
-                push_array_arg(&mut script, "-x");
-                push_array_arg(&mut script, "none");
-                for missing_path in missing_ir_files {
-                    push_array_arg(&mut script, &format!("-Wl,{}", missing_path.display()));
+                if !missing_ir_files.is_empty() {
+                    push_array_arg(&mut script, "-x");
+                    push_array_arg(&mut script, "none");
+                    for missing_path in missing_ir_files {
+                        push_array_arg(&mut script, &format!("-Wl,{}", missing_path.display()));
+                    }
                 }
                 emitted_bitcode = true;
             }
@@ -2616,6 +2626,13 @@ fn generate_link_cmd_file(
             index += 1;
             continue;
         }
+        // -x applies to subsequent file inputs, not just the bitcode. Reset
+        // it before an unclassified native input, but not after the last file:
+        // a trailing -x none produces a Clang unused-argument warning.
+        if emitted_bitcode && !arg.starts_with('-') {
+            push_array_arg(&mut script, "-x");
+            push_array_arg(&mut script, "none");
+        }
         push_array_arg(&mut script, arg);
         index += 1;
     }
@@ -2623,10 +2640,12 @@ fn generate_link_cmd_file(
         push_array_arg(&mut script, "-x");
         push_array_arg(&mut script, "ir");
         push_array_arg(&mut script, &format!("./{bc_filename}"));
-        push_array_arg(&mut script, "-x");
-        push_array_arg(&mut script, "none");
-        for missing_path in missing_ir_files {
-            push_array_arg(&mut script, &format!("-Wl,{}", missing_path.display()));
+        if !missing_ir_files.is_empty() {
+            push_array_arg(&mut script, "-x");
+            push_array_arg(&mut script, "none");
+            for missing_path in missing_ir_files {
+                push_array_arg(&mut script, &format!("-Wl,{}", missing_path.display()));
+            }
         }
     }
 
@@ -2712,9 +2731,7 @@ fn main() {
     };
 
     let has_shared_flag = args.iter().any(|arg| arg == "-shared");
-    let has_object_inputs = args[1..]
-        .iter()
-        .any(|arg| arg.ends_with(".o") && !arg.starts_with('-'));
+    let has_object_inputs = args[1..].iter().any(|arg| is_object_input(arg));
 
     let has_source_inputs = args[1..]
         .iter()

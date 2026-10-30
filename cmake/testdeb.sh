@@ -14,7 +14,7 @@
 #   abseil, brotli, c-ares, libjpeg-turbo, libpng, leveldb, spdlog, 
 #   googletest, cpuinfo, glfw, yaml-cpp, zlib, libxml2, curl, rapidjson,
 #   armadillo, libwebp, tidy-html5, highway, flac, libuv, lz4, snappy,
-#   json-c, libogg, libzstd
+#   json-c, libogg, libzstd, libyang, mold
 # ============================================================================
 
 set -e
@@ -109,6 +109,38 @@ prepare_source() {
             cd "$source_root"
             apt-get source "$package_name"
         ) >&2
+    fi
+
+    mapfile -t source_dirs < <(find "$source_root" -mindepth 1 -maxdepth 1 -type d -print | sort)
+    if [ "${#source_dirs[@]}" -ne 1 ]; then
+        print_error "未找到唯一的源码目录：$source_root" >&2
+        return 1
+    fi
+
+    printf '%s\n' "${source_dirs[0]}"
+}
+
+# 下载指定版本的源码压缩包，并返回其中唯一的解压源码目录。
+prepare_tarball_source() {
+    local source_name="$1"
+    local version="$2"
+    local primary_url="$3"
+    local fallback_url="$4"
+    local source_root="${SOURCES_BASE_DIR}/${source_name}/${version}"
+    local source_dirs=()
+
+    if [ ! -d "$source_root" ] || [ -z "$(find "$source_root" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+        print_info "下载 $source_name $version 源码..." >&2
+        rm -rf "$source_root"
+        mkdir -p "$source_root"
+        local archive="${source_root}/${source_name}-${version}.tar.gz"
+        if ! curl -fL --retry 2 --connect-timeout 20 -o "$archive" "$primary_url" >&2; then
+            print_info "主下载地址失败，尝试镜像地址..." >&2
+            rm -f "$archive"
+            curl -fL --retry 2 --connect-timeout 20 -o "$archive" "$fallback_url" >&2
+        fi
+        tar -xf "$archive" -C "$source_root" >&2
+        rm -f "$archive"
     fi
 
     mapfile -t source_dirs < <(find "$source_root" -mindepth 1 -maxdepth 1 -type d -print | sort)
@@ -2580,6 +2612,145 @@ test_ecbuild() {
     print_success "$project_name 测试通过"
 }
 
+# 测试 libyang（CMake；同一源码目录被多个 binary dir 复用）
+test_libyang() {
+    local project_name="libyang"
+    local project_version="${LIBYANG_VERSION:-6.4.13}"
+    local project_dir
+    project_dir="$(prepare_tarball_source \
+        "$project_name" "$project_version" \
+        "https://github.com/CESNET/libyang/archive/refs/tags/v${project_version}.tar.gz" \
+        "https://gitee.com/mirrors/libyang/repository/archive/v${project_version}.tar.gz")"
+    local build_dir="${BUILD_BASE_DIR}/${project_name}"
+    local install_dir="${INSTALL_BASE_DIR}/${project_name}"
+
+    print_header "测试 $project_name (YANG 数据建模语言库，含 yangupdate 测试)"
+
+    if [ ! -f "$project_dir/CMakeLists.txt" ]; then
+        print_error "项目目录不存在：$project_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir" "$install_dir"
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+
+    print_info "配置项目（启用测试，覆盖重复 add_subdirectory 的静态库）..."
+    CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DENABLE_TESTS=ON \
+        -DENABLE_VALGRIND_TESTS=OFF \
+        "$project_dir"
+
+    # libyang 在找不到 CMocka 时会静默关闭测试，此时无法覆盖 yangupdate
+    # 的重复 add_subdirectory 场景，必须视为测试失败。
+    if [ ! -d "$build_dir/tests/yangupdate" ]; then
+        print_error "libyang 测试未启用（通常是因为缺少 CMocka）"
+        return 1
+    fi
+
+    print_info "构建项目..."
+    cmake --build . -j$(nproc) -v
+
+    print_info "验证 yangupdate 静态库 LLVM archive..."
+    local yangupdate_archive="$build_dir/llvmir/tests/yangupdate/complex_update/libyutest_complex_update_lib.a"
+    local yangupdate_bc="$build_dir/llvmir/tests/yangupdate/yangupdate_complex_update.bc"
+    if [ ! -f "$yangupdate_archive" ] || [ ! -f "$yangupdate_bc" ]; then
+        print_error "未找到 yangupdate 的 LLVM archive 或合并位码"
+        return 1
+    fi
+    verify_llvm_archives "$yangupdate_archive"
+    llvm-dis-22 "$yangupdate_bc" -o - 2>/dev/null | head -5
+    print_success "yangupdate 重复 add_subdirectory 位码验证通过"
+
+    print_info "安装项目..."
+    cmake --install . --prefix "$install_dir"
+
+    print_info "验证安装的位码文件..."
+    if ! ls "$install_dir/lib/llvmir/"*.bc 1> /dev/null 2>&1; then
+        print_error "未找到安装的位码文件"
+        return 1
+    fi
+    local bc_count
+    bc_count=$(find "$install_dir/lib/llvmir" -maxdepth 1 -name '*.bc' | wc -l)
+    print_success "找到 $bc_count 个位码文件"
+    ls -lh "$install_dir/lib/llvmir/"*.bc | head -10
+
+    local shared_bc
+    shared_bc=$(find "$install_dir/lib/llvmir" -maxdepth 1 -name 'libyang.so*.bc' -print -quit)
+    if [ -z "$shared_bc" ]; then
+        print_error "未找到 libyang 动态库位码"
+        return 1
+    fi
+    llvm-dis-22 "$shared_bc" -o - 2>/dev/null | head -5
+    print_success "动态库位码验证通过"
+
+    print_info "验证 LLVM IR 链接脚本..."
+    test_link_scripts "$install_dir"
+
+    print_success "$project_name 测试通过"
+}
+
+# 测试 mold（CMake，链接器）
+test_mold() {
+    local project_name="mold"
+    local project_dir
+    project_dir="$(prepare_source "$project_name" "$project_name")"
+    local build_dir="${BUILD_BASE_DIR}/${project_name}"
+    local install_dir="${INSTALL_BASE_DIR}/${project_name}"
+
+    print_header "测试 $project_name (高速链接器)"
+
+    if [ ! -f "$project_dir/CMakeLists.txt" ]; then
+        print_error "项目目录不存在：$project_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir" "$install_dir"
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+
+    print_info "配置项目..."
+    CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DBUILD_TESTING=ON \
+        "$project_dir"
+
+    print_info "构建项目..."
+    cmake --build . -j$(nproc) -v
+
+    print_info "安装项目..."
+    cmake --install . --prefix "$install_dir"
+
+    print_info "验证安装的位码文件..."
+    local mold_bc="$install_dir/lib/llvmir-bin/mold.bc"
+    local wrapper_bc="$install_dir/lib/llvmir/mold-wrapper.so.bc"
+    if [ ! -f "$mold_bc" ] || [ ! -f "$wrapper_bc" ]; then
+        print_error "未找到 mold 或 mold-wrapper 的位码文件"
+        return 1
+    fi
+    ls -lh "$mold_bc" "$wrapper_bc"
+    llvm-dis-22 "$mold_bc" -o - 2>/dev/null | head -5
+    llvm-dis-22 "$wrapper_bc" -o - 2>/dev/null | head -5
+    print_success "mold 和 mold-wrapper 位码验证通过"
+
+    print_info "验证 LLVM IR 链接脚本..."
+    # mold 可执行文件的 bitcode 非常大，重新链接会再次执行数分钟的
+    # llvm-link；这里验证共享库和第三方库的链接脚本，跳过 mold_cmd。
+    test_link_scripts "$install_dir" "mold_cmd"
+
+    print_success "$project_name 测试通过"
+}
+
 # 显示帮助信息
 show_help() {
     echo "CMakeEmitLLVMIR 项目测试脚本"
@@ -2619,6 +2790,8 @@ show_help() {
     echo "  libzstd        - Zstandard 压缩库"
     echo "  mariadb        - MariaDB（CMake，含 embedded server 动态库）"
     echo "  ecbuild        - ecbuild（CMake 构建系统工具）"
+    echo "  libyang        - libyang（CMake，含 yangupdate 测试）"
+    echo "  mold           - mold（CMake 高速链接器）"
     echo ""
     echo "注意：leveldb、spdlog、googletest、cpuinfo、glfw、yaml-cpp、libxml2, armadillo、libwebp 和 highway 支持静态库和动态库分别测试"
     echo "  leveldb-static   - 测试 leveldb 静态库"
@@ -2690,6 +2863,8 @@ main() {
 	# too slow
         test_highway_static || print_error "highway-static 失败"
         test_highway_shared || print_error "highway-shared 失败"
+        test_libyang || print_error "libyang 失败"
+        test_mold || print_error "mold 失败"
 
         print_header "测试完成"
         print_success "所有测试完成！"
@@ -2873,6 +3048,12 @@ main() {
                     ;;
                 ecbuild)
                     test_ecbuild
+                    ;;
+                libyang)
+                    test_libyang
+                    ;;
+                mold)
+                    test_mold
                     ;;
                 *)
                     print_error "未知项目：$project"

@@ -31,6 +31,14 @@ add_library(fixture_dep_alias ALIAS fixture_dep)
 add_executable(linked_app linked_main.c)
 target_link_libraries(linked_app PRIVATE fixture_dep)
 
+# Mirror libyang's yangupdate tests: the same source directory is added twice
+# with different binary directories, and each instance defines its own static
+# library. Both instances must be registered for LLVM IR processing.
+add_subdirectory(reused_source duplicate_one)
+add_subdirectory(reused_source duplicate_two)
+add_executable(duplicate_linked_app linked_main.c)
+target_link_libraries(duplicate_linked_app PRIVATE duplicate_one_lib)
+
 add_library(interface_dep INTERFACE)
 target_link_libraries(interface_dep INTERFACE "$<BUILD_INTERFACE:fixture_dep_alias>")
 add_executable(interface_linked_app linked_main.c)
@@ -139,7 +147,7 @@ target_link_libraries(cycle_b PUBLIC cycle_a)
 add_executable(cycle_app cycle_main.c)
 target_link_libraries(cycle_app PRIVATE cycle_a)
 
-install(TARGETS selected_app object_app object_variant_one_app object_variant_two_app linked_app interface_linked_app forward_linked_app same_stem versioned_shared xlinker_versioned_shared static_shared_dependency static_shared_consumer lib_prefixed_output custom_suffix_shared zero_soversion_shared asm_shared asm_object_shared asm_static asm_static_app embedded_static embedded_static_app whole_archive_static whole_archive_shared external_archive_shared fixture_dep forward_dep debug_postfix_app generated_source_app generated_shadow_app cycle_app
+install(TARGETS selected_app object_app object_variant_one_app object_variant_two_app linked_app interface_linked_app forward_linked_app duplicate_linked_app duplicate_one_lib same_stem versioned_shared xlinker_versioned_shared static_shared_dependency static_shared_consumer lib_prefixed_output custom_suffix_shared zero_soversion_shared asm_shared asm_object_shared asm_static asm_static_app embedded_static embedded_static_app whole_archive_static whole_archive_shared external_archive_shared fixture_dep forward_dep debug_postfix_app generated_source_app generated_shadow_app cycle_app
   EXPORT LLVMIRFixtureTargets
   FILE_SET fixture_headers DESTINATION include
   RUNTIME DESTINATION bin

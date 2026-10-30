@@ -48,6 +48,12 @@ def _section_end(lines, start):
 
 def _files_package_name(header):
     tokens = shlex.split(header)
+    # -f takes a file-list path, not a positional subpackage name.
+    while "-f" in tokens:
+        index = tokens.index("-f")
+        if index + 1 >= len(tokens):
+            raise ValueError("%files -f is missing its manifest path: %s" % header)
+        del tokens[index:index + 2]
     if len(tokens) == 1:
         return "%{name}"
     if "-n" in tokens:

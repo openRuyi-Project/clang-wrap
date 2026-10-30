@@ -1,6 +1,20 @@
 set(_fixture_source "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/selection")
 set(_module "${PROJECT_SOURCE_DIR}/cmake/CMakeEmitLLVMIR.cmake")
 
+add_test(
+  NAME cmake-emit-llvmir-target-argument-forwarding
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/target-arguments
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-target-arguments.cmake
+)
+add_test(
+  NAME cmake-emit-llvmir-source-cache-versions
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run-source-cache.sh
+    ${PROJECT_SOURCE_DIR}/testdeb.sh
+    ${CMAKE_CURRENT_BINARY_DIR}/source-cache
+)
+
 foreach(_generator IN ITEMS Ninja "Unix Makefiles")
   string(REPLACE " " "_" _generator_id "${_generator}")
   foreach(_mode IN ITEMS ON OFF)

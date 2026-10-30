@@ -117,7 +117,13 @@ fn main() {
     let mut missing_ir_files: Vec<PathBuf> = Vec::new();
 
     for obj_file in &member_files {
-        if !obj_file.extension().map(|e| e == "o").unwrap_or(false) {
+        // Libtool compiles PIC objects with the `.os` suffix; both are native
+        // object files that need a corresponding LLVM IR member.
+        if !obj_file
+            .extension()
+            .map(|e| e == "o" || e == "os" || e == "lo")
+            .unwrap_or(false)
+        {
             continue;
         }
 
@@ -272,7 +278,14 @@ fn main() {
         llvm_ar_path.canonicalize(),
     ) {
         if current_exe == found_exe {
-            llvm_ar_path = get_exe_path(ar_cmd);
+            // Keep the versioned llvm-ar name (e.g. llvm-ar-22) when resolving
+            // the real tool; `ar` would resolve to GNU ar, which cannot write
+            // an LLVM bitcode archive.
+            let llvm_ar_name = llvm_ar_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("llvm-ar");
+            llvm_ar_path = get_exe_path(llvm_ar_name);
         }
     }
 

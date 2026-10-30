@@ -152,20 +152,15 @@ pub fn get_exe_path(exe_name: &str) -> PathBuf {
 /// Find LLVM tool in PATH
 /// If clang_cmd has a version suffix (e.g. clang-22), prefer finding tool with version suffix (e.g. llvm-link-22)
 pub fn find_llvm_tool(tool_name: &str, clang_cmd: &str) -> PathBuf {
-    // Try to extract version suffix from clang_cmd
-    // e.g.: clang-22 -> -22, clang++-22 -> -22
-    let version_suffix = if let Some(rest) = clang_cmd.strip_prefix("clang") {
-        // Check if there's a version suffix (starting with - or +)
-        if rest.starts_with('-') || rest.starts_with('+') {
-            rest.to_string()
-        } else if !rest.is_empty() && rest.chars().next().map(|c| c.is_numeric()).unwrap_or(false) {
-            // clang22 -> -22
-            format!("-{}", rest)
+    // Extract a trailing numeric version from any LLVM tool name:
+    // clang-22 -> -22, clang++-22 -> -22, llvm-link-22 -> -22.
+    let version_suffix = {
+        let trimmed = clang_cmd.trim_end_matches(|c: char| c.is_ascii_digit());
+        if trimmed.len() < clang_cmd.len() {
+            format!("-{}", &clang_cmd[trimmed.len()..])
         } else {
             String::new()
         }
-    } else {
-        String::new()
     };
 
     // If there's a version suffix, first try to find tool with version suffix
