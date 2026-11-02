@@ -6,7 +6,7 @@ endif()
 
 if(EXISTS "${NATIVE_LINK_FILE}")
   file(READ "${NATIVE_LINK_FILE}" _native_command)
-elseif(CMAKE_MAKE_PROGRAM MATCHES "ninja$")
+elseif(NATIVE_GENERATOR STREQUAL "Ninja" OR CMAKE_MAKE_PROGRAM MATCHES "(^|/)ninja(-build)?$")
   execute_process(
     COMMAND "${CMAKE_MAKE_PROGRAM}" -C "${NINJA_BUILD_DIR}" -t commands "${TARGET_NAME}"
     OUTPUT_VARIABLE _commands
@@ -18,7 +18,7 @@ elseif(CMAKE_MAKE_PROGRAM MATCHES "ninja$")
   endif()
   string(REPLACE "\n" ";" _command_lines "${_commands}")
   foreach(_line IN LISTS _command_lines)
-    if(_line MATCHES "(^|/)(llvm-)?ar( |$)")
+    if(_line MATCHES "(^|/)(llvm-)?ar(-[0-9]+(\\.[0-9]+)*)?( |$)")
       set(_native_command "${_line}")
       break()
     endif()

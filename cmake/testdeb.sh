@@ -14,7 +14,7 @@
 #   abseil, brotli, c-ares, libjpeg-turbo, libpng, leveldb, spdlog, 
 #   googletest, cpuinfo, glfw, yaml-cpp, zlib, libxml2, curl, rapidjson,
 #   armadillo, libwebp, tidy-html5, highway, flac, libuv, lz4, snappy,
-#   json-c, libogg, libzstd, libyang, mold
+#   json-c, libogg, libzstd, libyang, mold, libical
 # ============================================================================
 
 set -e
@@ -2440,6 +2440,81 @@ test_libogg() {
     test_libogg_static
 }
 
+# 测试 libical 项目（CMake，构建库和测试）
+test_libical() {
+    local project_name="libical"
+    local project_dir="$(prepare_source "$project_name" "libical3")"
+    local build_dir="${BUILD_BASE_DIR}/${project_name}"
+    local install_dir="${INSTALL_BASE_DIR}/${project_name}"
+
+    print_header "测试 $project_name (iCalendar 库和测试)"
+
+    if [ ! -f "$project_dir/CMakeLists.txt" ]; then
+        print_error "项目目录不存在或缺少 CMakeLists.txt：$project_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir" "$install_dir"
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+
+    print_info "配置项目..."
+    CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DGOBJECT_INTROSPECTION=OFF \
+        -DICAL_BUILD_DOCS=OFF \
+        -DICAL_GLIB_VAPI=OFF \
+        -DLIBICAL_BUILD_EXAMPLES=OFF \
+        -DLIBICAL_BUILD_TESTING=ON \
+        "$project_dir"
+
+    print_info "构建项目和测试..."
+    cmake --build . -j$(nproc) -v
+
+    print_info "运行测试..."
+    ctest --output-on-failure
+
+    print_info "安装项目..."
+    cmake --install . --prefix "$install_dir"
+
+    print_info "验证安装的位码文件..."
+    local bc_count
+    bc_count=$(find "$install_dir/lib/llvmir" -maxdepth 1 -name '*.bc' -type f 2>/dev/null | wc -l)
+    if [ "$bc_count" -eq 0 ]; then
+        print_error "未找到安装的 LLVM 位码文件"
+        return 1
+    fi
+    print_success "找到 $bc_count 个 LLVM 位码文件"
+    find "$install_dir/lib/llvmir" -maxdepth 1 -name '*.bc' -type f -print | head -10
+
+    local static_archive="$install_dir/lib/llvmir/libical.a"
+    if [ -f "$static_archive" ]; then
+        print_info "验证 libical 静态库 LLVM archive..."
+        verify_llvm_archives "$static_archive"
+    fi
+
+    # The source generator is installed under libexec, outside lib/llvmir*.
+    local generator_dir="$install_dir/libexec/lib/llvmir-bin"
+    if [ ! -f "$generator_dir/ical-glib-src-generator.bc" ] ||
+       [ ! -f "$generator_dir/ical-glib-src-generator_cmd" ]; then
+        print_error "未找到 ical-glib-src-generator 的位码或链接脚本"
+        return 1
+    fi
+    print_info "验证 ical-glib-src-generator LLVM IR 链接脚本..."
+    (
+        cd "$generator_dir"
+        bash ./ical-glib-src-generator_cmd
+    )
+
+    test_link_scripts "$install_dir"
+    print_success "$project_name 测试通过"
+}
+
 # 测试 libzstd 项目（同时构建静态库和动态库）
 test_libzstd() {
     local project_name="libzstd"
@@ -2787,6 +2862,7 @@ show_help() {
     echo "  snappy         - Google 压缩库"
     echo "  json-c         - JSON 解析库"
     echo "  libogg         - 测试 libogg 动态库和静态库"
+    echo "  libical        - iCalendar 库（CMake，含测试）"
     echo "  libzstd        - Zstandard 压缩库"
     echo "  mariadb        - MariaDB（CMake，含 embedded server 动态库）"
     echo "  ecbuild        - ecbuild（CMake 构建系统工具）"
@@ -3039,6 +3115,9 @@ main() {
                     ;;
                 libogg-static)
                     test_libogg_static
+                    ;;
+                libical)
+                    test_libical
                     ;;
                 libzstd)
                     test_libzstd

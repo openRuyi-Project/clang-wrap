@@ -62,6 +62,18 @@ add_test(
 )
 
 add_test(
+  NAME cmake-emit-llvmir-Ninja-build-program-name
+  COMMAND ${CMAKE_COMMAND}
+    -DCASE_MODE=ON
+    -DFIXTURE_SOURCE=${_fixture_source}
+    -DMODULE_FILE=${_module}
+    -DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/ninja-build-name
+    -DTEST_GENERATOR=Ninja
+    -DTEST_NINJA_BUILD_NAME=ON
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-fixture.cmake
+)
+
+add_test(
   NAME cmake-emit-llvmir-response-file-expanded
   COMMAND ${CMAKE_COMMAND}
     -DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/EmitLLVMIRLinkCommand.cmake

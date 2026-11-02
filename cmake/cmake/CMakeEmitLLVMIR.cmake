@@ -1275,6 +1275,7 @@ function(cmake_emit_llvmir_process_target target)
         "-DTARGET_BINARY_DIR=${_target_binary_dir}"
         "-DLINK_SEARCH_DIRS=${_link_search_dirs_argument}"
         "-DCLANG_VERSION_LINE=${CMAKE_EMIT_LLVMIR_CLANG_VERSION_LINE}"
+        "-DNATIVE_GENERATOR=${CMAKE_GENERATOR}"
         "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
         -P "${_CMAKE_EMIT_LLVMIR_MODULE_DIR}/EmitLLVMIRLinkCommand.cmake"
       )
@@ -1293,6 +1294,7 @@ function(cmake_emit_llvmir_process_target target)
         "-DTARGET_BINARY_DIR=${_target_binary_dir}"
         "-DTARGET_NAME=${target}"
         "-DNINJA_BUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DNATIVE_GENERATOR=${CMAKE_GENERATOR}"
         "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
         "-DBC_FILES=${_archive_bc_files_argument}"
         -P "${_CMAKE_EMIT_LLVMIR_MODULE_DIR}/EmitLLVMIRArchive.cmake"
