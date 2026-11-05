@@ -2716,6 +2716,10 @@ fn main() {
     // Check for -c and -E options
     let compile_flag_pos = args.iter().position(|arg| arg == "-c");
     let preprocess_flag_pos = args.iter().position(|arg| arg == "-E");
+    // -M and -MM request dependency output only (they imply preprocessing,
+    // without producing an object). Do not treat source arguments as a link
+    // command or run the LLVM IR compilation pass for these invocations.
+    let dependency_only = args.iter().any(|arg| matches!(arg.as_str(), "-M" | "-MM"));
 
     let (has_compile_flag, has_preprocess_flag) = match (compile_flag_pos, preprocess_flag_pos) {
         (Some(c_pos), Some(e_pos)) => {
@@ -2740,7 +2744,7 @@ fn main() {
     let is_link_command =
         !has_compile_flag && (has_object_inputs || has_shared_flag || has_source_inputs);
 
-    if has_preprocess_flag {
+    if has_preprocess_flag || dependency_only {
         let status = Command::new(&clang_path)
             .args(&args[1..])
             .status()

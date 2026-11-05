@@ -12,6 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
+use clang_wrap::install::sync_installed_llvmir;
 use clang_wrap::{
     compute_llvmir_path, compute_llvmir_target_dir, debug_log, ensure_dir_exists, find_llvmir_file,
     get_exe_path, get_llvm_ir_dir, get_program_name, is_debug_mode, resolve_cmd_name,
@@ -219,6 +220,33 @@ fn main() {
     // Case 3: Single source file with explicit target
     if parsed.sources.len() == 1 {
         let source = &parsed.sources[0];
+
+        if let (Ok(destdir), Some(dest)) = (env::var("DESTDIR"), parsed.destination.as_ref()) {
+            let actual_dest = resolve_single_dest(source, dest);
+            let destdir = PathBuf::from(destdir);
+            let installed_dest = if actual_dest.starts_with(&destdir) {
+                actual_dest
+            } else if actual_dest.is_absolute() {
+                destdir.join(actual_dest.strip_prefix("/").unwrap_or(&actual_dest))
+            } else {
+                env::current_dir().unwrap_or_default().join(actual_dest)
+            };
+            if let Err(error) =
+                sync_installed_llvmir(source, &installed_dest, &llvmir_dir, None, debug)
+            {
+                debug_log(
+                    debug,
+                    &format!(
+                        "[DEBUG] Failed to install LLVM IR for {}: {error}",
+                        source.display()
+                    ),
+                );
+                eprintln!(
+                    "Warning: Failed to install LLVM IR for {}: {error}",
+                    source.display()
+                );
+            }
+        }
 
         if let Some(llvmir_source) = find_llvmir_file(source, &llvmir_dir) {
             debug_log(

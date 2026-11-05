@@ -357,7 +357,7 @@ test_xfsprogs() {
 		rm -rf ~/tmp/llvmir/`pwd`
 		./configure && make V=1 -j`nproc` && \
 			make install DESTDIR=`pwd`/install
-		llvmir_install="$HOME/tmp/llvmir/`pwd`/install"
+		llvmir_install="install"
 		if ! find "$llvmir_install" -name '*_cmd' -print -quit | grep -q .; then
 			echo "ERROR: xfsprogs 未生成 LLVM IR 链接脚本" >&2
 			return 1
@@ -419,6 +419,39 @@ test_skalibs() {
 	)
 }
 
+# 测试 btrfs-progs（autotools）
+test_btrfs_progs() {
+	pkg=btrfs-progs
+	export CLANG_WRAP_DEBUG=1
+	export EMIT_LLVMIR=1
+	export PATH=`pwd`/clang-wrap-install/bin:$PATH
+	export CC=clang-22 CXX=clang++-22 AR=llvm-ar-22
+	mkdir -p testdeb/$pkg
+	(
+		cd testdeb/$pkg
+		if ! find . -mindepth 1 -maxdepth 1 -type d -name 'btrfs-progs-*' -print -quit | grep -q .; then
+			apt-get source $pkg
+		fi
+		cd btrfs-progs-*
+		if [ ! -f configure ]; then
+			./autogen.sh
+		fi
+		rm -rf ~/tmp/llvmir/`pwd`
+		if [ ! -f Makefile.inc ]; then
+			./configure --disable-documentation --disable-python
+		fi
+		make V=1 -j`nproc` && \
+			make install DESTDIR=`pwd`/install
+		llvmir_install=install
+		if ! find "$llvmir_install" -name '*_cmd' -print -quit | grep -q .; then
+			echo "ERROR: btrfs-progs 未生成 LLVM IR 链接脚本" >&2
+			return 1
+		fi
+		run_llvmir_cmds install/usr/local/lib/llvmir
+		run_llvmir_cmds install/usr/local/lib/llvmir-bin
+	)
+}
+
 # 显示帮助信息
 show_help() {
 	echo "用法: $0 [命令]"
@@ -443,6 +476,7 @@ show_help() {
 	echo "  xfsprogs     - 测试 xfsprogs 包"
 	echo "  elfutils     - 测试 elfutils 包"
 	echo "  skalibs      - 测试 skalibs 包"
+	echo "  btrfs-progs  - 测试 btrfs-progs 包"
 	echo "  all          - 构建并测试所有包"
 	echo "  help         - 显示此帮助信息"
 	echo ""
@@ -509,6 +543,9 @@ main() {
 		skalibs)
 			test_skalibs
 			;;
+		btrfs-progs)
+			test_btrfs_progs
+			;;
 		all)
 			build
 			test_libxml2
@@ -529,6 +566,7 @@ main() {
 			test_xfsprogs
 			test_elfutils
 			test_skalibs
+			test_btrfs_progs
 			;;
 		help|-h|--help)
 			show_help

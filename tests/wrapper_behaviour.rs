@@ -93,6 +93,37 @@ fn run_wrapper(binary: &str, cwd: &Path, llvmir_dir: &Path, args: &[&str]) {
     assert!(status.success(), "{binary} wrapper failed with {status}");
 }
 
+#[test]
+fn dependency_only_mm_invocation_does_not_create_llvmir_or_link() {
+    if !command_exists("clang") {
+        eprintln!("skipping dependency-only test: clang is unavailable");
+        return;
+    }
+
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    write_file(&root.join("source.c"), "#include <stddef.h>\nint value;\n");
+
+    let status = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args(["-MM", "-MF", "source.d", "source.c"])
+        .status()
+        .expect("failed to execute clang wrapper for dependency generation");
+
+    assert!(
+        status.success(),
+        "dependency generation failed with {status}"
+    );
+    assert!(root.join("source.d").is_file());
+    assert!(
+        !llvmir_dir.exists(),
+        "dependency-only invocation must not create LLVM IR output"
+    );
+}
+
 fn run_meson_install(cwd: &Path, llvmir_dir: &Path, manifest: &Path, destdir: &Path) {
     let status = Command::new(bin("meson-install"))
         .current_dir(cwd)
@@ -594,6 +625,39 @@ fn install_executable_rename_rewrites_llvmir_and_cmd_content() {
     assert!(script.contains("--output=output/renamed-demo"));
     assert!(!script.contains("./demo"));
     assert!(!script.contains("output/demo"));
+}
+
+#[test]
+fn cp_with_destdir_installs_executable_llvmir_sidecars() {
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let source = root.join("build/xfs_copy");
+    let staged = root.join("image/usr/sbin/xfs_copy");
+    let source_ir = llvmir_path(&llvmir_dir, &source);
+    let source_cmd = PathBuf::from(format!("{}_cmd", source_ir.display()));
+
+    write_file(&source, "native executable");
+    write_file(&source_ir, "bitcode");
+    write_file(
+        &source_cmd,
+        "#!/bin/bash\n# Original output: xfs_copy\ncmd=(clang ./xfs_copy --output=output/xfs_copy)\n\"${cmd[@]}\"\n",
+    );
+    fs::create_dir_all(staged.parent().unwrap()).unwrap();
+
+    let status = Command::new(bin("cp"))
+        .current_dir(root)
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .env("DESTDIR", root.join("image"))
+        .args(["build/xfs_copy", "image/usr/sbin/xfs_copy"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let installed_dir = root.join("image/usr/lib/llvmir-sbin");
+    assert!(staged.exists());
+    assert!(installed_dir.join("xfs_copy").exists());
+    assert!(installed_dir.join("xfs_copy_cmd").exists());
 }
 
 #[test]

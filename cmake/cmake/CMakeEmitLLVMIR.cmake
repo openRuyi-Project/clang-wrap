@@ -23,7 +23,6 @@
 if(DEFINED CMAKE_EMIT_LLVMIR_INCLUDED)
   return()
 endif()
-set(CMAKE_EMIT_LLVMIR_INCLUDED TRUE)
 set(_CMAKE_EMIT_LLVMIR_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 # Check if LLVM IR emission is enabled via environment variable
@@ -38,6 +37,16 @@ if(_emit_llvmir_value MATCHES "^(0|OFF|FALSE)$" OR _emit_llvmir_value STREQUAL "
 endif()
 
 set(CMAKE_EMIT_LLVMIR_ENABLED TRUE)
+
+# CMAKE_PROJECT_INCLUDE is invoked for every project() call, including
+# project(... NONE) in CMake-only repositories. Do not fail such a configure:
+# there is no compilable source for LLVM IR. The module include guard must
+# remain unset so a later subproject can enable C or C++ and initialize it.
+if(NOT CMAKE_C_COMPILER AND NOT CMAKE_CXX_COMPILER)
+  message(STATUS "CMakeEmitLLVMIR: no C or C++ language enabled; skipping LLVM IR for this project() call")
+  return()
+endif()
+set(CMAKE_EMIT_LLVMIR_INCLUDED TRUE)
 
 # The module emits ELF relink scripts and deliberately supports Linux only.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -1017,8 +1026,14 @@ function(cmake_emit_llvmir_process_target target)
     set(_target_source_dir "${CMAKE_SOURCE_DIR}")
   endif()
   
-  # Get the binary directory for this target (needed for generated files)
-  get_target_property(_target_binary_dir ${target} BINARY_DIR)
+  # Prefer the directory recorded while walking CMake's directory target
+  # lists. Helper macros can create a target while exposing a different
+  # SOURCE_DIR, but generated sources still belong to the creation directory.
+  get_property(_target_binary_dir GLOBAL PROPERTY
+    "CMAKE_EMIT_LLVMIR_TARGET_BINARY_DIR_${target}")
+  if(NOT _target_binary_dir OR _target_binary_dir STREQUAL "_target_binary_dir-NOTFOUND")
+    get_target_property(_target_binary_dir ${target} BINARY_DIR)
+  endif()
   if(NOT _target_binary_dir OR _target_binary_dir STREQUAL "_target_binary_dir-NOTFOUND")
     set(_target_binary_dir "${CMAKE_BINARY_DIR}")
   endif()
@@ -1068,14 +1083,30 @@ function(cmake_emit_llvmir_process_target target)
       set(_source_dir_path "${_target_source_dir}/${_source}")
       set(_binary_dir_path "${_target_binary_dir}/${_source}")
       set(_top_level_binary_dir_path "${CMAKE_BINARY_DIR}/${_source}")
-      
-      if(_source_is_generated)
+
+      # Some helper functions (notably Qt's QML module helpers) add a
+      # generated source by basename while creating it in a subdirectory's
+      # binary tree. If the target directory cannot recover that subdirectory
+      # from the source property, use the unique generated file in the build
+      # tree. The absolute path is important for Makefile dependencies.
+      file(GLOB_RECURSE _generated_source_candidates
+        LIST_DIRECTORIES false
+        "${CMAKE_BINARY_DIR}/*/${_source}")
+      list(LENGTH _generated_source_candidates _generated_source_count)
+
+      if(NOT EXISTS "${_source_dir_path}" AND _generated_source_count EQUAL 1)
+        list(GET _generated_source_candidates 0 _source_path)
+      elseif(_source_is_generated)
         set(_source_path "${_binary_dir_path}")
       # If file exists in source dir, use it
       elseif(EXISTS "${_source_dir_path}")
         set(_source_path "${_source_dir_path}")
       elseif(EXISTS "${_binary_dir_path}")
         # A target can generate sources in its own binary directory.
+        set(_source_path "${_binary_dir_path}")
+      elseif(NOT EXISTS "${_source_dir_path}")
+        # Generated sources do not necessarily exist until the build starts.
+        # Their relative names are rooted in the target's binary directory.
         set(_source_path "${_binary_dir_path}")
       elseif(EXISTS "${_top_level_binary_dir_path}")
         # Object libraries declared at the top level can contribute generated
@@ -1595,6 +1626,11 @@ endfunction()
 # outputs are shared by their consumers, so they must be registered first.
 function(_cmake_emit_llvmir_collect_directory_targets dir result_var)
   get_property(_targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
+  get_property(_binary_dir DIRECTORY ${dir} PROPERTY BINARY_DIR)
+  foreach(_target IN LISTS _targets)
+    set_property(GLOBAL PROPERTY
+      "CMAKE_EMIT_LLVMIR_TARGET_BINARY_DIR_${_target}" "${_binary_dir}")
+  endforeach()
   get_property(_subdirs DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
   foreach(_subdir IN LISTS _subdirs)
     _cmake_emit_llvmir_collect_directory_targets(${_subdir} _subdir_targets)

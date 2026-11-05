@@ -9,6 +9,13 @@ add_test(
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run-target-arguments.cmake
 )
 add_test(
+  NAME cmake-emit-llvmir-no-language-project
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/no-language-project
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-no-language-project.cmake
+)
+add_test(
   NAME cmake-emit-llvmir-source-cache-versions
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run-source-cache.sh
     ${PROJECT_SOURCE_DIR}/testdeb.sh
@@ -126,6 +133,18 @@ add_test(
     -DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/EmitLLVMIRLinkCommand.cmake
     -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/negative-ninja-link
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run-negative-case.cmake
+)
+
+find_program(_test_llvm_ar NAMES llvm-ar-23 llvm-ar-22 llvm-ar REQUIRED)
+
+add_test(
+  NAME cmake-emit-llvmir-ninja-static-archive
+  COMMAND ${CMAKE_COMMAND}
+    -DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/EmitLLVMIRArchive.cmake
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/ninja-static-archive
+    -DLLVM_AR=${_test_llvm_ar}
+    -DNINJA=${CMAKE_MAKE_PROGRAM}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-ninja-archive.cmake
 )
 
 add_test(
