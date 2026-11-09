@@ -2017,9 +2017,20 @@ fn handle_link_command(
                     ir_path.display()
                 ),
             );
-            let sidecar_path = PathBuf::from(format!("{}_missing", ir_path.display()));
-            static_llvm_archives.push(ir_path);
-            merge_missing_ir_file(&mut missing_ir_files, &sidecar_path);
+            if is_valid_llvm_bitcode(&ir_path) {
+                debug_log(
+                    debug_mode,
+                    &format!(
+                        "[DEBUG] Treating .a LLVM IR sidecar as a single bitcode module: {}",
+                        ir_path.display()
+                    ),
+                );
+                direct_llvm_ir_files.push(ir_path);
+            } else {
+                let sidecar_path = PathBuf::from(format!("{}_missing", ir_path.display()));
+                static_llvm_archives.push(ir_path);
+                merge_missing_ir_file(&mut missing_ir_files, &sidecar_path);
+            }
         } else {
             debug_log(
                 debug_mode,

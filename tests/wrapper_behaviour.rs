@@ -124,6 +124,59 @@ fn dependency_only_mm_invocation_does_not_create_llvmir_or_link() {
     );
 }
 
+#[test]
+fn shared_library_named_with_a_suffix_is_linked_as_single_bitcode_module() {
+    if !command_exists("clang") || !command_exists("llvm-link") {
+        eprintln!("skipping shared-library .a test: clang or llvm-link is unavailable");
+        return;
+    }
+
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let library_ir = llvmir_path(&llvmir_dir, &root.join("libuwsgi.a"));
+    write_file(
+        &root.join("library.c"),
+        "int library_value(void) { return 0; }\n",
+    );
+    write_file(
+        &root.join("main.c"),
+        "int library_value(void); int main(void) { return library_value(); }\n",
+    );
+
+    let native_library = Command::new("clang")
+        .current_dir(root)
+        .args(["-shared", "-fPIC", "library.c", "-o", "libuwsgi.a"])
+        .status()
+        .expect("failed to build shared-library fixture");
+    assert!(native_library.success());
+
+    fs::create_dir_all(library_ir.parent().unwrap()).unwrap();
+    let llvm_library = Command::new("clang")
+        .current_dir(root)
+        .args([
+            "-emit-llvm",
+            "-c",
+            "library.c",
+            "-o",
+            library_ir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to build shared-library bitcode fixture");
+    assert!(llvm_library.success());
+
+    let status = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args(["main.c", "libuwsgi.a", "-o", "app"])
+        .status()
+        .expect("failed to link shared-library .a fixture");
+
+    assert!(status.success(), "clang wrapper failed with {status}");
+    assert!(llvmir_path(&llvmir_dir, &root.join("app")).is_file());
+}
+
 fn run_meson_install(cwd: &Path, llvmir_dir: &Path, manifest: &Path, destdir: &Path) {
     let status = Command::new(bin("meson-install"))
         .current_dir(cwd)

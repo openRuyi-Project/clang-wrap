@@ -362,8 +362,8 @@ test_xfsprogs() {
 			echo "ERROR: xfsprogs 未生成 LLVM IR 链接脚本" >&2
 			return 1
 		fi
-		run_llvmir_cmds "$llvmir_install/usr/lib64"
-		run_llvmir_cmds "$llvmir_install/usr/lib"
+		run_llvmir_cmds "$llvmir_install/usr/lib/llvmir-sbin"
+		run_llvmir_cmds "$llvmir_install/usr/lib64/llvmir"
 	)
 }
 
