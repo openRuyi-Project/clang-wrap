@@ -54,11 +54,17 @@ if(NOT _build_result EQUAL 0)
   message(FATAL_ERROR "Fixture build failed:\n${_build_output}\n${_build_error}")
 endif()
 
-if(TEST_GENERATOR STREQUAL "Ninja")
+if(TEST_GENERATOR STREQUAL "Ninja" AND CASE_MODE STREQUAL "ON")
   file(READ "${TEST_BINARY_DIR}/build.ninja" _ninja_build_file)
   string(FIND "${_ninja_build_file}" "-DNATIVE_GENERATOR=Ninja" _native_generator_position)
   if(_native_generator_position EQUAL -1)
     message(FATAL_ERROR "Ninja static archive command does not pass NATIVE_GENERATOR=Ninja")
+  endif()
+elseif(TEST_GENERATOR STREQUAL "Ninja")
+  file(READ "${TEST_BINARY_DIR}/build.ninja" _ninja_build_file)
+  if(_ninja_build_file MATCHES "EmitLLVMIR(Archive|LinkCommand)\\.cmake" OR
+     _ninja_build_file MATCHES "-DNATIVE_GENERATOR=Ninja")
+    message(FATAL_ERROR "LLVM IR commands were registered while emission was disabled")
   endif()
 endif()
 
@@ -67,6 +73,7 @@ set(_unselected_bc "${TEST_OUTPUT_DIR}/unselected_app.bc")
 set(_nested_bc "${TEST_OUTPUT_DIR}/nested/nested_cpp.bc")
 set(_object_bc "${TEST_OUTPUT_DIR}/object_app.bc")
 set(_same_stem_archive "${TEST_OUTPUT_DIR}/same_stem_output.archive")
+set(_unity_archive "${TEST_OUTPUT_DIR}/libunity_target.a")
 set(_linked_bc "${TEST_OUTPUT_DIR}/linked_app.bc")
 set(_duplicate_linked_bc "${TEST_OUTPUT_DIR}/duplicate_linked_app.bc")
 set(_duplicate_one_archive "${TEST_OUTPUT_DIR}/duplicate_one/libduplicate_one_lib.a")
@@ -90,7 +97,7 @@ if(TEST_BUILD_TYPE STREQUAL "Debug")
 endif()
 if(CASE_MODE STREQUAL "ON")
   if(NOT EXISTS "${_selected_bc}" OR NOT EXISTS "${_unselected_bc}" OR NOT EXISTS "${_nested_bc}" OR
-     NOT EXISTS "${_object_bc}" OR NOT EXISTS "${_same_stem_archive}" OR NOT EXISTS "${_linked_bc}" OR
+     NOT EXISTS "${_object_bc}" OR NOT EXISTS "${_same_stem_archive}" OR NOT EXISTS "${_unity_archive}" OR NOT EXISTS "${_linked_bc}" OR
      NOT EXISTS "${_duplicate_linked_bc}" OR NOT EXISTS "${_duplicate_one_archive}" OR
      NOT EXISTS "${_duplicate_two_archive}" OR
      NOT EXISTS "${_interface_linked_bc}" OR NOT EXISTS "${_forward_linked_bc}" OR NOT EXISTS "${_generated_source_bc}" OR NOT EXISTS "${_cycle_bc}" OR
@@ -467,7 +474,7 @@ if(CASE_MODE STREQUAL "ON")
   endif()
 else()
   if(EXISTS "${_selected_bc}" OR EXISTS "${_unselected_bc}" OR EXISTS "${_nested_bc}" OR
-     EXISTS "${_object_bc}" OR EXISTS "${_same_stem_archive}" OR EXISTS "${_linked_bc}" OR
+     EXISTS "${_object_bc}" OR EXISTS "${_same_stem_archive}" OR EXISTS "${_unity_archive}" OR EXISTS "${_linked_bc}" OR
      EXISTS "${_interface_linked_bc}" OR EXISTS "${_forward_linked_bc}" OR EXISTS "${_generated_source_bc}" OR EXISTS "${_cycle_bc}" OR
      EXISTS "${_lib_prefixed_bc}" OR EXISTS "${_custom_suffix_bc}" OR EXISTS "${_whole_archive_bc}" OR EXISTS "${_external_archive_bc}")
     message(FATAL_ERROR "Disabled mode unexpectedly generated bitcode.")

@@ -16,6 +16,13 @@ add_test(
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run-no-language-project.cmake
 )
 add_test(
+  NAME cmake-emit-llvmir-subproject-language
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/subproject-language
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-subproject-language.cmake
+)
+add_test(
   NAME cmake-emit-llvmir-source-cache-versions
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run-source-cache.sh
     ${PROJECT_SOURCE_DIR}/testdeb.sh

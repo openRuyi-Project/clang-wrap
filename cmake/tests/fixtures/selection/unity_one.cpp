@@ -1,0 +1,1 @@
+int unity_one(void) { return 1; }

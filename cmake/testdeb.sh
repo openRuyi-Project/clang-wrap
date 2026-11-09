@@ -14,7 +14,7 @@
 #   abseil, brotli, c-ares, libjpeg-turbo, libpng, leveldb, spdlog, 
 #   googletest, cpuinfo, glfw, yaml-cpp, zlib, libxml2, curl, rapidjson,
 #   armadillo, libwebp, tidy-html5, highway, flac, libuv, lz4, snappy,
-#   json-c, libogg, libzstd, libyang, mold, libical, milou, freerdp3
+#   json-c, libogg, libzstd, libyang, mold, libical, milou, freerdp3, llama.cpp
 # ============================================================================
 
 set -e
@@ -2651,6 +2651,84 @@ test_mariadb() {
     test_link_scripts "$install_dir"
 }
 
+# 测试 llama.cpp（APT 源码包，CPU shared libraries）
+test_llama_cpp() {
+    local project_name="llama.cpp"
+    local project_dir
+    project_dir="$(prepare_source "$project_name" "$project_name")"
+    local build_dir="${BUILD_BASE_DIR}/${project_name}"
+    local install_dir="${INSTALL_BASE_DIR}/${project_name}"
+
+    print_header "测试 $project_name (CPU shared libraries)"
+
+    if [ ! -f "$project_dir/CMakeLists.txt" ]; then
+        print_error "项目目录不存在或缺少 CMakeLists.txt：$project_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir" "$install_dir"
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+
+    print_info "配置项目（启用 Unity Build；禁用测试、示例、工具和 GPU 后端）..."
+    CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_UNITY_BUILD=ON \
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DBUILD_SHARED_LIBS=ON \
+        -DLLAMA_BUILD_COMMON=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_TOOLS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_SERVER=OFF \
+        -DGGML_BUILD_TESTS=OFF \
+        -DGGML_BUILD_EXAMPLES=OFF \
+        -DGGML_CUDA=OFF \
+        -DGGML_HIP=OFF \
+        -DGGML_MUSA=OFF \
+        -DGGML_VULKAN=OFF \
+        -DGGML_WEBGPU=OFF \
+        -DGGML_METAL=OFF \
+        -DGGML_SYCL=OFF \
+        -DGGML_OPENVINO=OFF \
+        -DGGML_OPENCL=OFF \
+        -DGGML_HEXAGON=OFF \
+        -DGGML_ZDNN=OFF \
+        -DGGML_VIRTGPU=OFF \
+        -DGGML_BLAS=OFF \
+        "$project_dir"
+
+    print_info "构建项目..."
+    cmake --build . -j$(nproc) -v
+
+    print_info "安装项目..."
+    cmake --install . --prefix "$install_dir"
+
+    print_info "验证安装的 llama.cpp 和 ggml shared libraries/LLVM IR..."
+    local llama_library llama_bitcode ggml_bitcode ggml_library
+    llama_library="$(find "$install_dir" -type f -name 'libllama.so*' -print -quit)"
+    llama_bitcode="$(find "$install_dir" -type f -path '*/llvmir/*' -name 'libllama.so*.bc' -print -quit)"
+    ggml_bitcode="$(find "$install_dir" -type f -path '*/llvmir/*' -name 'libggml.so*.bc' -print -quit)"
+    ggml_library="$(find "$install_dir" -type f -name 'libggml.so*' -print -quit)"
+    if [ -z "$llama_library" ] || [ -z "$llama_bitcode" ] ||
+       [ -z "$ggml_library" ] || [ -z "$ggml_bitcode" ]; then
+        print_error "未找到 llama/ggml shared library 或对应 LLVM IR"
+        find "$install_dir" -maxdepth 5 -type f -print | sort
+        return 1
+    fi
+    ls -lh "$llama_library" "$llama_bitcode" "$ggml_library" "$ggml_bitcode"
+    llvm-dis-22 "$llama_bitcode" -o /dev/null
+    llvm-dis-22 "$ggml_bitcode" -o /dev/null
+
+    print_info "验证 LLVM IR 链接脚本..."
+    test_link_scripts "$install_dir"
+
+    print_success "$project_name 测试通过"
+}
+
 # 测试 ecbuild 项目（CMake 构建系统工具）
 test_ecbuild() {
     local project_name="ecbuild"
@@ -2913,9 +2991,7 @@ test_mold() {
     print_success "mold 和 mold-wrapper 位码验证通过"
 
     print_info "验证 LLVM IR 链接脚本..."
-    # mold 可执行文件的 bitcode 非常大，重新链接会再次执行数分钟的
-    # llvm-link；这里验证共享库和第三方库的链接脚本，跳过 mold_cmd。
-    test_link_scripts "$install_dir" "mold_cmd"
+    test_link_scripts "$install_dir"
 
     print_success "$project_name 测试通过"
 }
@@ -2963,6 +3039,7 @@ show_help() {
     echo "  libyang        - libyang（CMake，含 yangupdate 测试）"
     echo "  mold           - mold（CMake 高速链接器）"
     echo "  freerdp3       - FreeRDP（CMake 远程桌面协议实现）"
+    echo "  llama.cpp      - llama.cpp（APT 源码包，CPU shared libraries）"
     echo ""
     echo "注意：leveldb、spdlog、googletest、cpuinfo、glfw、yaml-cpp、libxml2, armadillo、libwebp 和 highway 支持静态库和动态库分别测试"
     echo "  leveldb-static   - 测试 leveldb 静态库"
@@ -3036,6 +3113,7 @@ main() {
         test_highway_shared || print_error "highway-shared 失败"
         test_libyang || print_error "libyang 失败"
         test_mold || print_error "mold 失败"
+        test_llama_cpp || print_error "llama.cpp 失败"
 
         print_header "测试完成"
         print_success "所有测试完成！"
@@ -3219,6 +3297,9 @@ main() {
                     ;;
                 mariadb)
                     test_mariadb
+                    ;;
+                llama.cpp)
+                    test_llama_cpp
                     ;;
                 ecbuild)
                     test_ecbuild

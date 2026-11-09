@@ -20,7 +20,8 @@
 #   processes all targets created with add_executable() and add_library().
 #
 
-if(DEFINED CMAKE_EMIT_LLVMIR_INCLUDED)
+get_property(_emit_llvmir_initialized GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_INCLUDED)
+if(_emit_llvmir_initialized)
   return()
 endif()
 set(_CMAKE_EMIT_LLVMIR_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}")
@@ -47,6 +48,8 @@ if(NOT CMAKE_C_COMPILER AND NOT CMAKE_CXX_COMPILER)
   return()
 endif()
 set(CMAKE_EMIT_LLVMIR_INCLUDED TRUE)
+set_property(GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_INCLUDED TRUE)
+set_property(GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_INITIALIZATION_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # The module emits ELF relink scripts and deliberately supports Linux only.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -245,9 +248,12 @@ endfunction()
 # Configuration
 # ============================================================================
 
-if(NOT DEFINED CMAKE_EMIT_LLVMIR_OUTPUT_DIR)
+if(NOT CMAKE_EMIT_LLVMIR_OUTPUT_DIR)
   set(CMAKE_EMIT_LLVMIR_OUTPUT_DIR "${CMAKE_BINARY_DIR}/llvmir")
 endif()
+get_filename_component(CMAKE_EMIT_LLVMIR_OUTPUT_DIR
+  "${CMAKE_EMIT_LLVMIR_OUTPUT_DIR}" ABSOLUTE BASE_DIR "${CMAKE_BINARY_DIR}")
+set_property(GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_OUTPUT_ROOT "${CMAKE_EMIT_LLVMIR_OUTPUT_DIR}")
 
 # The compilation database is the source of truth for compiler invocations.
 # This intentionally overrides a project-level OFF value while emission is
@@ -507,19 +513,23 @@ endfunction()
 # Keep emitted artifacts below the configured output root. Targets in
 # subdirectories retain their binary-directory layout, preventing collisions.
 function(_cmake_emit_llvmir_get_target_output_dir target result_var)
+  get_property(_output_root GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_OUTPUT_ROOT)
+  if(NOT IS_ABSOLUTE "${_output_root}" OR NOT IS_ABSOLUTE "${CMAKE_BINARY_DIR}")
+    message(FATAL_ERROR "CMakeEmitLLVMIR requires absolute output and build directories")
+  endif()
   get_target_property(_target_binary_dir ${target} BINARY_DIR)
-  if(NOT _target_binary_dir OR _target_binary_dir STREQUAL "_target_binary_dir-NOTFOUND")
+  if(NOT IS_ABSOLUTE "${_target_binary_dir}" OR NOT IS_DIRECTORY "${_target_binary_dir}")
     set(_target_binary_dir "${CMAKE_BINARY_DIR}")
   endif()
   file(RELATIVE_PATH _relative_binary_dir "${CMAKE_BINARY_DIR}" "${_target_binary_dir}")
   if(_relative_binary_dir STREQUAL "." OR _relative_binary_dir STREQUAL "")
-    set(_output_dir "${CMAKE_EMIT_LLVMIR_OUTPUT_DIR}")
+    set(_output_dir "${_output_root}")
   elseif(_relative_binary_dir MATCHES "^\\.\\.")
     string(SHA256 _dir_hash "${_target_binary_dir}")
     string(SUBSTRING "${_dir_hash}" 0 12 _dir_hash)
-    set(_output_dir "${CMAKE_EMIT_LLVMIR_OUTPUT_DIR}/external-${_dir_hash}")
+    set(_output_dir "${_output_root}/external-${_dir_hash}")
   else()
-    set(_output_dir "${CMAKE_EMIT_LLVMIR_OUTPUT_DIR}/${_relative_binary_dir}")
+    set(_output_dir "${_output_root}/${_relative_binary_dir}")
   endif()
   set(${result_var} "${_output_dir}" PARENT_SCOPE)
 endfunction()
@@ -959,6 +969,16 @@ function(cmake_emit_llvmir_process_target target)
   get_target_property(_target_type ${target} TYPE)
   get_target_property(_target_name ${target} NAME)
   get_target_property(_target_sources ${target} SOURCES)
+
+  # Bitcode commands are registered per source and recovered from the
+  # compilation database. Unity builds replace those source entries with
+  # generated amalgamation files, so preserve per-source compilation for
+  # targets that need LLVM IR.
+  get_target_property(_unity_build ${target} UNITY_BUILD)
+  if(_unity_build)
+    message(STATUS "CMakeEmitLLVMIR: disabling UNITY_BUILD for ${target} to emit per-source bitcode")
+    set_target_properties(${target} PROPERTIES UNITY_BUILD OFF)
+  endif()
 
   if(NOT _target_type MATCHES "^(EXECUTABLE|STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY)$")
     return()
@@ -1640,6 +1660,20 @@ function(_cmake_emit_llvmir_collect_directory_targets dir result_var)
 endfunction()
 
 function(_cmake_emit_llvmir_process_all_targets)
+  # Initialization may happen in a child project() while this deferred call
+  # runs at the root. Recover the state from the directory that enabled C/C++.
+  get_property(_initialization_dir GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_INITIALIZATION_DIR)
+  foreach(_variable IN ITEMS
+      CMAKE_EMIT_LLVMIR_ENABLED CMAKE_EMIT_LLVMIR_OUTPUT_DIR
+      CMAKE_EMIT_LLVMIR_LLVM_VERSION CMAKE_EMIT_LLVMIR_CLANG_VERSION_LINE
+      _CMAKE_EMIT_LLVMIR_MODULE_DIR _emit_llvmir_extra_flags_file
+      CMAKE_C_COMPILER CMAKE_CXX_COMPILER
+      CMAKE_C_IMPLICIT_LINK_DIRECTORIES CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES
+      CMAKE_STATIC_LIBRARY_PREFIX CMAKE_STATIC_LIBRARY_SUFFIX
+      CMAKE_SHARED_LIBRARY_PREFIX CMAKE_SHARED_LIBRARY_SUFFIX
+      CMAKE_SHARED_MODULE_PREFIX CMAKE_SHARED_MODULE_SUFFIX)
+    get_directory_property(${_variable} DIRECTORY "${_initialization_dir}" DEFINITION ${_variable})
+  endforeach()
   if(NOT CMAKE_EMIT_LLVMIR_ENABLED)
     return()
   endif()

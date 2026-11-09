@@ -26,6 +26,9 @@ add_executable(object_variant_two_app object_variant_main.c $<TARGET_OBJECTS:obj
 add_library(same_stem STATIC same.c same.cpp)
 set_target_properties(same_stem PROPERTIES OUTPUT_NAME same_stem_output PREFIX "" SUFFIX ".archive")
 
+add_library(unity_target STATIC unity_one.cpp unity_two.cpp)
+set_target_properties(unity_target PROPERTIES UNITY_BUILD ON)
+
 add_library(fixture_dep STATIC nested/dep.c)
 add_library(fixture_dep_alias ALIAS fixture_dep)
 add_executable(linked_app linked_main.c)
@@ -147,7 +150,7 @@ target_link_libraries(cycle_b PUBLIC cycle_a)
 add_executable(cycle_app cycle_main.c)
 target_link_libraries(cycle_app PRIVATE cycle_a)
 
-install(TARGETS selected_app object_app object_variant_one_app object_variant_two_app linked_app interface_linked_app forward_linked_app duplicate_linked_app duplicate_one_lib same_stem versioned_shared xlinker_versioned_shared static_shared_dependency static_shared_consumer lib_prefixed_output custom_suffix_shared zero_soversion_shared asm_shared asm_object_shared asm_static asm_static_app embedded_static embedded_static_app whole_archive_static whole_archive_shared external_archive_shared fixture_dep forward_dep debug_postfix_app generated_source_app generated_shadow_app cycle_app
+install(TARGETS selected_app object_app object_variant_one_app object_variant_two_app linked_app interface_linked_app forward_linked_app duplicate_linked_app duplicate_one_lib same_stem unity_target versioned_shared xlinker_versioned_shared static_shared_dependency static_shared_consumer lib_prefixed_output custom_suffix_shared zero_soversion_shared asm_shared asm_object_shared asm_static asm_static_app embedded_static embedded_static_app whole_archive_static whole_archive_shared external_archive_shared fixture_dep forward_dep debug_postfix_app generated_source_app generated_shadow_app cycle_app
   EXPORT LLVMIRFixtureTargets
   FILE_SET fixture_headers DESTINATION include
   RUNTIME DESTINATION bin
