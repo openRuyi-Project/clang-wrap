@@ -14,7 +14,7 @@
 #   abseil, brotli, c-ares, libjpeg-turbo, libpng, leveldb, spdlog, 
 #   googletest, cpuinfo, glfw, yaml-cpp, zlib, libxml2, curl, rapidjson,
 #   armadillo, libwebp, tidy-html5, highway, flac, libuv, lz4, snappy,
-#   json-c, libogg, libzstd, libyang, mold, libical, milou, freerdp3, llama.cpp
+#   json-c, libogg, libzstd, libyang, mold, libical, milou, freerdp3, llama.cpp, qhull
 # ============================================================================
 
 set -e
@@ -339,6 +339,7 @@ test_abseil() {
         -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
         -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
         -DCMAKE_INSTALL_PREFIX="$install_dir" \
         -DABSL_BUILD_TESTING=ON \
@@ -2729,6 +2730,55 @@ test_llama_cpp() {
     print_success "$project_name 测试通过"
 }
 
+# Test qhull's C++ static library override of the default qh_fprintf symbol.
+test_qhull() {
+    local project_name="qhull"
+    local project_dir
+    project_dir="$(prepare_source "$project_name" "$project_name")"
+    local build_dir="${BUILD_BASE_DIR}/${project_name}"
+    local install_dir="${INSTALL_BASE_DIR}/${project_name}"
+
+    print_header "测试 $project_name (静态 C++/reentrant 链接顺序)"
+
+    if [ ! -f "$project_dir/CMakeLists.txt" ]; then
+        print_error "项目目录不存在或缺少 CMakeLists.txt：$project_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir" "$install_dir"
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+
+    print_info "配置项目..."
+    CMAKE_EMIT_LLVMIR=1 cmake -G "Unix Makefiles" \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_STATIC_LIBS=ON \
+        -DLINK_APPS_SHARED=OFF \
+        "$project_dir"
+
+    print_info "构建 qhull 及 LLVM IR..."
+    cmake --build . --target user_eg3 user_eg3_llvmir -j$(nproc) -v
+
+    print_info "运行原生 user_eg3 回归..."
+    ctest --output-on-failure -R '^user_eg3$'
+
+    print_info "验证 user_eg3 LLVM IR..."
+    local user_eg3_bc
+    user_eg3_bc="$(find "$build_dir/llvmir" -type f -name 'user_eg3.bc' -print -quit)"
+    if [ -z "$user_eg3_bc" ]; then
+        print_error "未找到 user_eg3 的 LLVM bitcode"
+        return 1
+    fi
+    llvm-dis-22 "$user_eg3_bc" -o /dev/null
+    print_success "qhull user_eg3 原生链接及 LLVM IR 验证通过"
+}
+
 # 测试 ecbuild 项目（CMake 构建系统工具）
 test_ecbuild() {
     local project_name="ecbuild"
@@ -3040,6 +3090,8 @@ show_help() {
     echo "  mold           - mold（CMake 高速链接器）"
     echo "  freerdp3       - FreeRDP（CMake 远程桌面协议实现）"
     echo "  llama.cpp      - llama.cpp（APT 源码包，CPU shared libraries）"
+    echo "  qhull          - qhull（C++ 静态库替换符号回归）"
+    echo "  qhull          - qhull（C++/reentrant 静态库替换符号回归）"
     echo ""
     echo "注意：leveldb、spdlog、googletest、cpuinfo、glfw、yaml-cpp、libxml2, armadillo、libwebp 和 highway 支持静态库和动态库分别测试"
     echo "  leveldb-static   - 测试 leveldb 静态库"
@@ -3133,6 +3185,9 @@ main() {
             case "$project" in
                 abseil)
                     test_abseil
+                    ;;
+                qhull)
+                    test_qhull
                     ;;
                 brotli)
                     test_brotli
@@ -3300,6 +3355,9 @@ main() {
                     ;;
                 llama.cpp)
                     test_llama_cpp
+                    ;;
+                qhull)
+                    test_qhull
                     ;;
                 ecbuild)
                     test_ecbuild

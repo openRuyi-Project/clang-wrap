@@ -38,7 +38,12 @@ else()
   set(_response_base_dir "${TARGET_BINARY_DIR}")
 endif()
 cmake_emit_llvmir_expand_response_arguments(_arguments "${_response_base_dir}" ${_arguments})
-string(REPLACE "," ";" _bitcode_members "${BC_FILES}")
+if(DEFINED INPUTS_FILE)
+  include("${INPUTS_FILE}")
+  set(_bitcode_members "${_direct_bc_files}")
+else()
+  string(REPLACE "," ";" _bitcode_members "${BC_FILES}")
+endif()
 set(_missing_members "")
 foreach(_argument IN LISTS _arguments)
   if(_argument MATCHES "(^|.*/)CMakeFiles/[^/]+\\.dir/.*\\.(o|O)$" AND
@@ -69,8 +74,16 @@ else()
 endif()
 get_filename_component(_archive_dir "${ARCHIVE_OUTPUT}" DIRECTORY)
 file(MAKE_DIRECTORY "${_archive_dir}")
+set(_response_content "")
+foreach(_input IN LISTS _bitcode_members)
+  string(REPLACE "\\" "\\\\" _quoted_input "${_input}")
+  string(REPLACE "\"" "\\\"" _quoted_input "${_quoted_input}")
+  string(APPEND _response_content "\"${_quoted_input}\"\n")
+endforeach()
+set(_response_file "${ARCHIVE_OUTPUT}.rsp")
+file(WRITE "${_response_file}" "${_response_content}")
 execute_process(
-  COMMAND "${LLVM_AR}" rcsD "${ARCHIVE_OUTPUT}" ${_bitcode_members}
+  COMMAND "${LLVM_AR}" rcsD "${ARCHIVE_OUTPUT}" "@${_response_file}"
   RESULT_VARIABLE _archive_result
   OUTPUT_VARIABLE _archive_output
   ERROR_VARIABLE _archive_error
@@ -78,3 +91,4 @@ execute_process(
 if(NOT _archive_result EQUAL 0)
   message(FATAL_ERROR "LLVM archive creation failed:\n${_archive_output}\n${_archive_error}")
 endif()
+file(REMOVE "${_response_file}")

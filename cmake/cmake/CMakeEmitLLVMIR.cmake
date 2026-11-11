@@ -124,7 +124,7 @@ function(add_library target)
     endwhile()
     string(APPEND _target_call " [${_delimiter}[${_argument}]${_delimiter}]")
   endforeach()
-  cmake_language(EVAL CODE "_add_library(${_target_call})")
+  cmake_language(EVAL CODE "__add_library(${_target_call})")
   _cmake_emit_llvmir_register_target("${target}")
 endfunction()
 
@@ -141,7 +141,7 @@ function(add_executable target)
     endwhile()
     string(APPEND _target_call " [${_delimiter}[${_argument}]${_delimiter}]")
   endforeach()
-  cmake_language(EVAL CODE "_add_executable(${_target_call})")
+  cmake_language(EVAL CODE "__add_executable(${_target_call})")
   _cmake_emit_llvmir_register_target("${target}")
 endfunction()
 
@@ -241,7 +241,22 @@ function(install)
     string(REPLACE "\"" "\\\"" _escaped_argument "${_escaped_argument}")
     string(APPEND _install_call " \"${_escaped_argument}\"")
   endforeach()
-  cmake_language(EVAL CODE "_install(${_install_call})")
+  cmake_language(EVAL CODE "__install(${_install_call})")
+endfunction()
+
+# CMake's _command alias changes whenever command is overridden again. Ceph's
+# BuildBoost.cmake, for example, wraps add_library after this module is loaded,
+# making _add_library refer to our wrapper. Preserve the previous command one
+# level deeper before a project can replace those aliases. These forwarding
+# functions keep the conventional aliases usable until the next override.
+function(_add_library)
+  __add_library(${ARGV})
+endfunction()
+function(_add_executable)
+  __add_executable(${ARGV})
+endfunction()
+function(_install)
+  __install(${ARGV})
 endfunction()
 
 # ============================================================================
@@ -703,8 +718,6 @@ function(_cmake_emit_llvmir_collect_static_bitcode target result_var visited_tar
         continue()
       endif()
       if(_library_type STREQUAL "STATIC_LIBRARY")
-        _cmake_emit_llvmir_collect_static_bitcode(${_library} _transitive_outputs "${visited_targets}")
-        list(APPEND _outputs ${_transitive_outputs})
         get_target_property(_library_output ${_library} EMIT_LLVMIR_OUTPUT)
         if(NOT _library_output OR _library_output STREQUAL "_library_output-NOTFOUND")
           # Static-library cycles and forward declarations can be observed
@@ -713,7 +726,11 @@ function(_cmake_emit_llvmir_collect_static_bitcode target result_var visited_tar
           _cmake_emit_llvmir_get_target_output_names(${_library} _library_output_name _library_native_name)
           set(_library_output "${_library_output_dir}/${_library_output_name}")
         endif()
+        # Match the native linker input order: the current archive is seen
+        # before archives from its transitive link interface.
         list(APPEND _outputs "${_library_output}")
+        _cmake_emit_llvmir_collect_static_bitcode(${_library} _transitive_outputs "${visited_targets}")
+        list(APPEND _outputs ${_transitive_outputs})
       elseif(_library_type STREQUAL "INTERFACE_LIBRARY")
         _cmake_emit_llvmir_collect_static_bitcode(${_library} _transitive_outputs "${visited_targets}")
         list(APPEND _outputs ${_transitive_outputs})
@@ -946,6 +963,97 @@ endfunction()
 # Main Target Processing Function
 # ============================================================================
 
+# Inspect configuration before compile_commands.json is generated. HIP/CUDA
+# can be enabled through ordinary CXX options as well as CMake languages.
+function(_cmake_emit_llvmir_detect_offload target)
+  # Custom targets do not compile sources. Querying source properties for their
+  # generated scripts can change CMake's relative source-path resolution.
+  get_target_property(_target_type "${target}" TYPE)
+  if(_target_type STREQUAL "UTILITY")
+    return()
+  endif()
+  get_target_property(_source_dir "${target}" SOURCE_DIR)
+  set(_options "")
+  foreach(_property IN ITEMS COMPILE_OPTIONS COMPILE_FLAGS INTERFACE_COMPILE_OPTIONS)
+    get_target_property(_value "${target}" ${_property})
+    list(APPEND _options "${_value}")
+  endforeach()
+  # Usage requirements may enable HIP on ordinary CXX sources. In particular,
+  # MAGMA inherits hip::device through shared-library interfaces. Imported
+  # targets are not part of the directory target registry, so walk their
+  # compile interfaces here rather than relying on skip-state propagation.
+  get_target_property(_compile_dependencies "${target}" LINK_LIBRARIES)
+  get_target_property(_interface_dependencies "${target}" INTERFACE_LINK_LIBRARIES)
+  list(APPEND _compile_dependencies ${_interface_dependencies})
+  set(_visited_compile_dependencies "${target}")
+  while(NOT "${_compile_dependencies}" STREQUAL "")
+    list(POP_FRONT _compile_dependencies _dependency)
+    # LINK_ONLY dependencies do not contribute compile usage requirements.
+    if(_dependency MATCHES "^\\$<LINK_ONLY:")
+      continue()
+    endif()
+    _cmake_emit_llvmir_normalize_link_target("${_dependency}" _dependency)
+    if(NOT _dependency OR _dependency IN_LIST _visited_compile_dependencies)
+      continue()
+    endif()
+    list(APPEND _visited_compile_dependencies "${_dependency}")
+    get_target_property(_device_compile "${_dependency}" INTERFACE_HIP_DEVICE_COMPILE)
+    if(_device_compile)
+      set_property(TARGET "${target}" PROPERTY EMIT_LLVMIR_SKIP_REASON
+        "HIP device compile interface from ${_dependency}")
+    endif()
+    get_target_property(_value "${_dependency}" INTERFACE_COMPILE_OPTIONS)
+    list(APPEND _options "${_value}")
+    get_target_property(_interface_dependencies "${_dependency}" INTERFACE_LINK_LIBRARIES)
+    list(APPEND _compile_dependencies ${_interface_dependencies})
+  endwhile()
+  get_directory_property(_directory_options DIRECTORY "${_source_dir}" COMPILE_OPTIONS)
+  list(APPEND _options ${_directory_options})
+  foreach(_language IN ITEMS C CXX HIP CUDA)
+    foreach(_suffix IN ITEMS "" "_${CMAKE_BUILD_TYPE}")
+      string(TOUPPER "${_suffix}" _suffix)
+      get_directory_property(_flags DIRECTORY "${_source_dir}"
+        DEFINITION CMAKE_${_language}_FLAGS${_suffix})
+      list(APPEND _options "${_flags}")
+    endforeach()
+  endforeach()
+  get_target_property(_sources "${target}" SOURCES)
+  foreach(_source IN LISTS _sources)
+    # Generator-expression source lists are not concrete file names. Looking
+    # them up as SOURCE entries can prefix them with the source directory and
+    # corrupt the later per-source build rules (for example yaml-cpp contrib).
+    if(_source MATCHES "^\\$<" OR _source MATCHES ">$" OR _source MATCHES "^<")
+      continue()
+    endif()
+    get_property(_language SOURCE "${_source}" TARGET_DIRECTORY "${target}" PROPERTY LANGUAGE)
+    if(_language MATCHES "^(HIP|CUDA)$" OR _source MATCHES "\\.(hip|cu)$")
+      set_property(TARGET "${target}" PROPERTY EMIT_LLVMIR_SKIP_REASON "HIP/CUDA source")
+    endif()
+    foreach(_property IN ITEMS COMPILE_OPTIONS COMPILE_FLAGS)
+      get_property(_value SOURCE "${_source}" TARGET_DIRECTORY "${target}" PROPERTY ${_property})
+      list(APPEND _options "${_value}")
+    endforeach()
+  endforeach()
+  # Tokenize shell flags, but keep quoted macro definitions as one argument.
+  # In particular -DHIP_COMPILER_FLAGS=" -x hip ... " is not a language switch.
+  string(JOIN " " _option ${_options})
+  separate_arguments(_arguments UNIX_COMMAND "${_option}")
+  set(_expect_language FALSE)
+  foreach(_argument IN LISTS _arguments)
+    if((_expect_language AND _argument MATCHES "^(hip|cuda)$") OR
+       _argument MATCHES "^-x(hip|cuda)$" OR
+       _argument MATCHES "^--(offload-arch|cuda-gpu-arch)(=|$)" OR
+       _argument MATCHES "^-fopenmp-targets(=|$)")
+      set_property(TARGET "${target}" PROPERTY EMIT_LLVMIR_SKIP_REASON "GPU/offload compile options")
+    endif()
+    if(_argument STREQUAL "-x")
+      set(_expect_language TRUE)
+    else()
+      set(_expect_language FALSE)
+    endif()
+  endforeach()
+endfunction()
+
 function(cmake_emit_llvmir_process_target target)
   if(NOT CMAKE_EMIT_LLVMIR_ENABLED)
     return()
@@ -963,6 +1071,12 @@ function(cmake_emit_llvmir_process_target target)
   endif()
   get_target_property(_imported_target ${target} IMPORTED)
   if(_imported_target)
+    return()
+  endif()
+
+  get_target_property(_skip_reason "${target}" EMIT_LLVMIR_SKIP_REASON)
+  if(_skip_reason)
+    message(STATUS "CMakeEmitLLVMIR: skipping LLVM IR for ${target}: ${_skip_reason}")
     return()
   endif()
 
@@ -1270,9 +1384,28 @@ function(cmake_emit_llvmir_process_target target)
     _cmake_emit_llvmir_collect_project_shared_outputs(${target} _project_shared_libraries "")
     list(JOIN _project_shared_libraries "|" _project_shared_libraries_argument)
 
-    list(JOIN _bc_files "," _direct_bc_files_argument)
-    list(JOIN _dependency_bc_files "," _static_bc_files_argument)
-    list(JOIN _whole_archive_bc_files "," _whole_archive_bc_files_argument)
+    # Keep potentially large input lists out of the process argument vector.
+    # Bracket arguments preserve spaces, commas, backslashes and dollar signs.
+    set(_bitcode_inputs_file "${_primary_output}.inputs.cmake")
+    set(_bitcode_inputs_content "")
+    foreach(_kind IN ITEMS direct static whole_archive)
+      if(_kind STREQUAL "direct")
+        set(_inputs "${_bc_files}")
+      elseif(_kind STREQUAL "static")
+        set(_inputs "${_dependency_bc_files}")
+      else()
+        set(_inputs "${_whole_archive_bc_files}")
+      endif()
+      set(_equals "=")
+      string(FIND "${_inputs}" "]${_equals}]" _closing_bracket)
+      while(NOT _closing_bracket EQUAL -1)
+        string(APPEND _equals "=")
+        string(FIND "${_inputs}" "]${_equals}]" _closing_bracket)
+      endwhile()
+      string(APPEND _bitcode_inputs_content
+        "set(_${_kind}_bc_files [${_equals}[${_inputs}]${_equals}])\n")
+    endforeach()
+    file(GENERATE OUTPUT "${_bitcode_inputs_file}" CONTENT "${_bitcode_inputs_content}")
 
     _cmake_emit_llvmir_handle_exports(${target})
     get_target_property(_version_script_name ${target} EMIT_LLVMIR_VERSION_SCRIPT_NAME)
@@ -1335,7 +1468,6 @@ function(cmake_emit_llvmir_process_target target)
 
     if(_target_type STREQUAL "STATIC_LIBRARY")
       set_property(TARGET ${target} PROPERTY EMIT_LLVMIR_OUTPUT "${_primary_output}")
-      list(JOIN _bc_files "," _archive_bc_files_argument)
       set(_archive_command
         ${CMAKE_COMMAND}
         "-DLLVM_AR=${CMAKE_EMIT_LLVMIR_llvm_ar_EXECUTABLE}"
@@ -1347,7 +1479,7 @@ function(cmake_emit_llvmir_process_target target)
         "-DNINJA_BUILD_DIR=${CMAKE_BINARY_DIR}"
         "-DNATIVE_GENERATOR=${CMAKE_GENERATOR}"
         "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
-        "-DBC_FILES=${_archive_bc_files_argument}"
+        "-DINPUTS_FILE=${_bitcode_inputs_file}"
         -P "${_CMAKE_EMIT_LLVMIR_MODULE_DIR}/EmitLLVMIRArchive.cmake"
       )
     else()
@@ -1361,7 +1493,7 @@ function(cmake_emit_llvmir_process_target target)
         add_custom_command(
           OUTPUT "${_primary_output}"
           COMMAND ${_archive_command}
-          DEPENDS ${_all_bc_files}
+          DEPENDS ${_all_bc_files} "${_bitcode_inputs_file}"
           COMMENT "Creating LLVM archive for ${target}"
           VERBATIM
         )
@@ -1374,12 +1506,10 @@ function(cmake_emit_llvmir_process_target target)
             "-DLLVM_NM=${CMAKE_EMIT_LLVMIR_llvm_nm_EXECUTABLE}"
             "-DLLVM_AR=${CMAKE_EMIT_LLVMIR_llvm_ar_EXECUTABLE}"
             "-DOUTPUT=${_primary_output}"
-            "-DDIRECT_BC_FILES=${_direct_bc_files_argument}"
-            "-DSTATIC_BC_FILES=${_static_bc_files_argument}"
-            "-DWHOLE_ARCHIVE_BC_FILES=${_whole_archive_bc_files_argument}"
+            "-DINPUTS_FILE=${_bitcode_inputs_file}"
             -P "${_CMAKE_EMIT_LLVMIR_MODULE_DIR}/EmitLLVMIRMerge.cmake"
           COMMAND ${_native_link_command}
-          DEPENDS ${_all_bc_files}
+          DEPENDS ${_all_bc_files} "${_bitcode_inputs_file}"
           COMMENT "Merging LLVM bitcode for ${target}"
           VERBATIM
         )
@@ -1699,6 +1829,42 @@ function(_cmake_emit_llvmir_process_all_targets)
     endif()
   endforeach()
   list(REMOVE_DUPLICATES _all_targets)
+
+  # Classify all targets first, including interface/object libraries, before
+  # any archive paths or IR dependencies are registered.
+  foreach(_target IN LISTS _all_targets)
+    _cmake_emit_llvmir_detect_offload("${_target}")
+  endforeach()
+  set(_skip_changed TRUE)
+  while(_skip_changed)
+    set(_skip_changed FALSE)
+    foreach(_target IN LISTS _all_targets)
+      get_target_property(_skip_reason "${_target}" EMIT_LLVMIR_SKIP_REASON)
+      if(_skip_reason)
+        continue()
+      endif()
+      get_target_property(_libraries "${_target}" LINK_LIBRARIES)
+      get_target_property(_interface "${_target}" INTERFACE_LINK_LIBRARIES)
+      get_target_property(_sources "${_target}" SOURCES)
+      foreach(_source IN LISTS _sources)
+        if(_source MATCHES "^\\$<TARGET_OBJECTS:([^>]+)>$")
+          list(APPEND _libraries "${CMAKE_MATCH_1}")
+        endif()
+      endforeach()
+      foreach(_library IN LISTS _libraries _interface)
+        _cmake_emit_llvmir_normalize_link_target("${_library}" _library)
+        if(NOT _library)
+          continue()
+        endif()
+        get_target_property(_dependency_skip "${_library}" EMIT_LLVMIR_SKIP_REASON)
+        get_target_property(_dependency_type "${_library}" TYPE)
+        if(_dependency_skip AND _dependency_type MATCHES "^(STATIC_LIBRARY|OBJECT_LIBRARY|INTERFACE_LIBRARY)$")
+          set_property(TARGET "${_target}" PROPERTY EMIT_LLVMIR_SKIP_REASON "depends on offload target ${_library}")
+          set(_skip_changed TRUE)
+        endif()
+      endforeach()
+    endforeach()
+  endwhile()
 
   # Register every static library before a consumer can compute its merged
   # bitcode as an input. This makes each static-library .bc file have exactly

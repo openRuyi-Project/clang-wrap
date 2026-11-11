@@ -1,5 +1,26 @@
 set(_fixture_source "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/selection")
 set(_module "${PROJECT_SOURCE_DIR}/cmake/CMakeEmitLLVMIR.cmake")
+add_test(
+  NAME cmake-emit-llvmir-project-command-wrappers
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/project-command-wrappers
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-project-command-wrappers.cmake
+)
+add_test(
+  NAME cmake-emit-llvmir-ninja-relative-inputs
+  COMMAND ${CMAKE_COMMAND}
+    -DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/EmitLLVMIRLinkCommand.cmake
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/ninja-relative-inputs
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-ninja-relative-inputs.cmake
+)
+add_test(
+  NAME cmake-emit-llvmir-offload-skip
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/offload-skip
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-offload-skip.cmake
+)
 
 add_test(
   NAME cmake-emit-llvmir-target-argument-forwarding
@@ -132,6 +153,34 @@ add_test(
     -DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/EmitLLVMIRFromCompileDatabase.cmake
     -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-db-option-filter
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run-compile-db-option-filter.cmake
+)
+find_program(_test_clang NAMES clang-23 clang-22 clang REQUIRED)
+find_program(_test_llvm_link NAMES llvm-link-23 llvm-link-22 llvm-link REQUIRED)
+find_program(_test_llvm_nm NAMES llvm-nm-23 llvm-nm-22 llvm-nm REQUIRED)
+find_program(_test_llvm_dis NAMES llvm-dis-23 llvm-dis-22 llvm-dis REQUIRED)
+find_program(_test_llvm_ar_order NAMES llvm-ar-23 llvm-ar-22 llvm-ar REQUIRED)
+add_test(
+  NAME cmake-emit-llvmir-long-inputs
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DCLANG=${_test_clang}
+    -DLLVM_AR=${_test_llvm_ar_order}
+    -DLLVM_LINK=${_test_llvm_link}
+    -DLLVM_NM=${_test_llvm_nm}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/long-inputs
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-long-inputs.cmake
+)
+add_test(
+  NAME cmake-emit-llvmir-static-archive-order
+  COMMAND ${CMAKE_COMMAND}
+    -DCLANG=${_test_clang}
+    -DLLVM_AR=${_test_llvm_ar_order}
+    -DLLVM_DIS=${_test_llvm_dis}
+    -DLLVM_LINK=${_test_llvm_link}
+    -DLLVM_NM=${_test_llvm_nm}
+    -DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/EmitLLVMIRMerge.cmake
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/static-archive-order
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-static-archive-order.cmake
 )
 add_test(
   NAME cmake-emit-llvmir-ninja-link-ambiguity-rejected
