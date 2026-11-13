@@ -2059,8 +2059,16 @@ fn handle_link_command(
         let tmp_suffix = generate_tmp_suffix();
         let tmp_ir_path = append_tmp_suffix(&ir_path, &tmp_suffix);
 
+        let llvm_compile_args: Vec<&String> = other_args
+            .iter()
+            .filter(|arg| {
+                !arg.starts_with("-Wl,")
+                    && !arg.starts_with("-l")
+                    && !is_ir_incompatible_option(arg)
+            })
+            .collect();
         let mut llvm_gen_cmd = Command::new(clang_path);
-        llvm_gen_cmd.args(&other_args);
+        llvm_gen_cmd.args(llvm_compile_args.iter().copied());
         llvm_gen_cmd.arg("-emit-llvm");
         llvm_gen_cmd.arg("-c");
         llvm_gen_cmd.arg(source_file);
@@ -2068,7 +2076,7 @@ fn handle_link_command(
 
         {
             let mut cmd_parts = vec![clang_path.display().to_string()];
-            cmd_parts.extend(other_args.clone());
+            cmd_parts.extend(llvm_compile_args.iter().map(|arg| (*arg).clone()));
             cmd_parts.push("-emit-llvm".to_string());
             cmd_parts.push("-c".to_string());
             cmd_parts.push(source_file.display().to_string());

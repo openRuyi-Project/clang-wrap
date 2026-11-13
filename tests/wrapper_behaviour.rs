@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use clang_wrap::is_valid_llvm_bitcode;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -122,6 +123,37 @@ fn dependency_only_mm_invocation_does_not_create_llvmir_or_link() {
         !llvmir_dir.exists(),
         "dependency-only invocation must not create LLVM IR output"
     );
+}
+
+#[test]
+fn llvmir_link_pass_omits_linker_only_arguments_with_werror() {
+    if !command_exists("clang") || !command_exists("llvm-link") {
+        eprintln!("skipping linker-only LLVM IR argument test: clang or llvm-link is unavailable");
+        return;
+    }
+
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    write_file(&root.join("main.c"), "int main(void) { return 0; }\n");
+
+    let status = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "-march=x86-64-v4")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args([
+            "-Werror",
+            "-Wl,-z,relro,-z,now,-z,noexecstack",
+            "-Wl,--as-needed",
+            "main.c",
+            "-o",
+            "main",
+        ])
+        .status()
+        .expect("failed to execute clang wrapper");
+
+    assert!(status.success(), "clang wrapper failed with {status}");
+    assert!(llvmir_path(&llvmir_dir, &root.join("main")).is_file());
 }
 
 #[test]
@@ -483,6 +515,71 @@ fn multi_source_compile_generates_bitcode_for_each_object() {
             object.display()
         );
     }
+}
+
+#[test]
+fn fat_lto_objects_option_is_omitted_from_llvmir_generation() {
+    if !command_exists("clang") {
+        eprintln!("skipping fat-LTO LLVM IR test: clang is unavailable");
+        return;
+    }
+
+    let test_dir = TestDir::new();
+    let root = test_dir.path();
+    let llvmir_dir = root.join("llvmir");
+    let object = root.join("module.o");
+    let object_ir = llvmir_path(&llvmir_dir, &object);
+    write_file(
+        &root.join("module.c"),
+        "int module(void) { return 42; } int main(void) { return module() != 42; }\n",
+    );
+
+    let status = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .args([
+            "-flto=auto",
+            "-ffat-lto-objects",
+            "-c",
+            "module.c",
+            "-o",
+            "module.o",
+        ])
+        .status()
+        .expect("failed to execute clang wrapper for fat-LTO compile");
+
+    assert!(status.success(), "clang wrapper failed with {status}");
+    assert!(object.is_file(), "native object was not generated");
+    assert!(
+        is_valid_llvm_bitcode(&object_ir),
+        "generated sidecar is not LLVM bitcode"
+    );
+
+    let link_status = Command::new(bin("clang"))
+        .current_dir(root)
+        .env("EMIT_LLVMIR", "1")
+        .env("LLVM_IR_DIR", &llvmir_dir)
+        .env("CLANG_WRAP_DEBUG", "1")
+        .args(["-flto=auto", "-ffat-lto-objects", "module.c", "-o", "app"])
+        .status()
+        .expect("failed to execute clang wrapper for fat-LTO link");
+
+    assert!(
+        link_status.success(),
+        "clang wrapper link failed with {link_status}"
+    );
+    let cmd_file = llvmir_path(&llvmir_dir, &root.join("app_cmd"));
+    let cmd = fs::read_to_string(cmd_file).expect("failed to read generated _cmd script");
+    assert!(!cmd.contains("-ffat-lto-objects"));
+    let debug_log = fs::read_to_string(llvmir_dir.join("clang-wrap-debug.log"))
+        .expect("failed to read clang-wrap debug log");
+    let ir_command = debug_log
+        .lines()
+        .rfind(|line| line.contains("[DEBUG] Generating LLVM IR for source:"))
+        .expect("link-time LLVM IR generation was not logged");
+    assert!(ir_command.contains("-emit-llvm"));
+    assert!(!ir_command.contains("-ffat-lto-objects"));
 }
 
 #[test]

@@ -12,7 +12,7 @@
 #
 # 支持的项目:
 #   abseil, brotli, c-ares, libjpeg-turbo, libpng, leveldb, spdlog, 
-#   googletest, cpuinfo, glfw, yaml-cpp, zlib, libxml2, curl, rapidjson,
+#   googletest, cpuinfo, xnnpack, glfw, yaml-cpp, zlib, libxml2, curl, rapidjson,
 #   armadillo, libwebp, tidy-html5, highway, flac, libuv, lz4, snappy,
 #   json-c, libogg, libzstd, libyang, mold, libical, milou, freerdp3, llama.cpp, qhull
 # ============================================================================
@@ -3046,6 +3046,70 @@ test_mold() {
     print_success "$project_name 测试通过"
 }
 
+# 测试 XNNPACK（系统依赖模式包含仅头文件的空静态库）
+test_xnnpack() {
+    local project_name="xnnpack"
+    local project_dir
+    project_dir="$(prepare_source "$project_name" "$project_name")"
+    local build_dir="${BUILD_BASE_DIR}/${project_name}"
+    local install_dir="${INSTALL_BASE_DIR}/${project_name}"
+    # 默认使用系统开发包，也支持解压在独立前缀中的依赖。
+    local dependency_prefix="${XNNPACK_DEPENDENCY_PREFIX:-/usr}"
+
+    print_header "测试 $project_name（系统依赖及空静态库）"
+    rm -rf "$build_dir" "$install_dir"
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+
+    CMAKE_EMIT_LLVMIR=1 cmake -G Ninja \
+        -DCMAKE_C_COMPILER=/usr/bin/clang-22 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/clang++-22 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${CMAKE_EMIT_LLVMIR_MODULE}" \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_PREFIX_PATH="$dependency_prefix" \
+        -DXNNPACK_LIBRARY_TYPE=shared \
+        -DXNNPACK_USE_SYSTEM_LIBS=ON \
+        -DXNNPACK_BUILD_TESTS=OFF \
+        -DXNNPACK_BUILD_BENCHMARKS=OFF \
+        -DXNNPACK_ENABLE_KLEIDIAI=OFF \
+        -DCPUINFO_SOURCE_DIR="$dependency_prefix" \
+        -DPTHREADPOOL_SOURCE_DIR="$dependency_prefix" \
+        -DFXDIV_SOURCE_DIR="$dependency_prefix" \
+        "$project_dir"
+
+    cmake --build . --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}" -v
+    cmake --install . --prefix "$install_dir"
+
+    local shared_bc
+    shared_bc=$(find "$install_dir/lib/llvmir" -maxdepth 1 -name 'libXNNPACK.so*.bc' -print -quit)
+    if [ -z "$shared_bc" ]; then
+        print_error "未找到 XNNPACK 动态库位码"
+        return 1
+    fi
+    llvm-dis-22 "$shared_bc" -o /dev/null
+
+    # 系统 FXdiv 必须生成空原生归档，消费者不能引用虚构的 IR 归档。
+    if [ ! -f "$build_dir/libfxdiv.a" ] || \
+       [ -n "$(llvm-ar-22 t "$build_dir/libfxdiv.a")" ]; then
+        print_error "未覆盖 FXdiv 空静态库场景"
+        return 1
+    fi
+    local inputs_file="$build_dir/llvmir/$(basename "$shared_bc").inputs.cmake"
+    if [ ! -f "$inputs_file" ]; then
+        print_error "未找到 XNNPACK 位码合并输入清单"
+        return 1
+    fi
+    if grep -Eq 'lib(fxdiv|fp16)\.a' "$inputs_file"; then
+        print_error "XNNPACK 合并输入仍包含空静态库"
+        return 1
+    fi
+    test_link_scripts "$install_dir"
+    print_success "$project_name 测试通过"
+}
+
 # 显示帮助信息
 show_help() {
     echo "CMakeEmitLLVMIR 项目测试脚本"
@@ -3066,6 +3130,7 @@ show_help() {
     echo "  spdlog         - 日志库"
     echo "  googletest     - 测试框架"
     echo "  cpuinfo        - CPU 信息检测库"
+    echo "  xnnpack        - 神经网络推理库（系统依赖及空静态库）"
     echo "  glfw           - OpenGL 窗口库"
     echo "  yaml-cpp       - YAML 解析库"
     echo "  zlib           - 压缩库"
@@ -3163,6 +3228,7 @@ main() {
 	# too slow
         test_highway_static || print_error "highway-static 失败"
         test_highway_shared || print_error "highway-shared 失败"
+        test_xnnpack || print_error "xnnpack 失败"
         test_libyang || print_error "libyang 失败"
         test_mold || print_error "mold 失败"
         test_llama_cpp || print_error "llama.cpp 失败"
@@ -3373,6 +3439,9 @@ main() {
                     ;;
                 mold)
                     test_mold
+                    ;;
+                xnnpack)
+                    test_xnnpack
                     ;;
                 *)
                     print_error "未知项目：$project"

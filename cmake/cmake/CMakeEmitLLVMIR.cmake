@@ -718,6 +718,7 @@ function(_cmake_emit_llvmir_collect_static_bitcode target result_var visited_tar
         continue()
       endif()
       if(_library_type STREQUAL "STATIC_LIBRARY")
+        get_target_property(_no_bitcode ${_library} EMIT_LLVMIR_NO_BITCODE)
         get_target_property(_library_output ${_library} EMIT_LLVMIR_OUTPUT)
         if(NOT _library_output OR _library_output STREQUAL "_library_output-NOTFOUND")
           # Static-library cycles and forward declarations can be observed
@@ -728,7 +729,9 @@ function(_cmake_emit_llvmir_collect_static_bitcode target result_var visited_tar
         endif()
         # Match the native linker input order: the current archive is seen
         # before archives from its transitive link interface.
-        list(APPEND _outputs "${_library_output}")
+        if(NOT _no_bitcode)
+          list(APPEND _outputs "${_library_output}")
+        endif()
         _cmake_emit_llvmir_collect_static_bitcode(${_library} _transitive_outputs "${visited_targets}")
         list(APPEND _outputs ${_transitive_outputs})
       elseif(_library_type STREQUAL "INTERFACE_LIBRARY")
@@ -764,6 +767,10 @@ function(_cmake_emit_llvmir_collect_whole_archive_bitcode target result_var)
       get_target_property(_library_type ${_library_target} TYPE)
       get_target_property(_library_imported ${_library_target} IMPORTED)
       if(_library_type STREQUAL "STATIC_LIBRARY" AND NOT _library_imported)
+        get_target_property(_no_bitcode ${_library_target} EMIT_LLVMIR_NO_BITCODE)
+        if(_no_bitcode)
+          continue()
+        endif()
         get_target_property(_library_bc_files ${_library_target} EMIT_LLVMIR_BC_FILES)
         if(NOT _library_bc_files OR _library_bc_files STREQUAL "_library_bc_files-NOTFOUND")
           message(FATAL_ERROR "Whole-archive static dependency ${_library_target} has no registered LLVM bitcode members.")
@@ -804,7 +811,10 @@ function(_cmake_emit_llvmir_collect_static_native_member_files target result_var
             _cmake_emit_llvmir_get_target_output_names(${_library} _library_output_name _library_native_name)
             set(_library_output "${_library_output_dir}/${_library_output_name}")
           endif()
-          list(APPEND _outputs "${_library_output}_missing")
+          get_target_property(_no_bitcode ${_library} EMIT_LLVMIR_NO_BITCODE)
+          if(NOT _no_bitcode)
+            list(APPEND _outputs "${_library_output}_missing")
+          endif()
         elseif(_library_type STREQUAL "INTERFACE_LIBRARY")
           _cmake_emit_llvmir_collect_static_native_member_files(${_library} _transitive_outputs "${visited_targets}")
           list(APPEND _outputs ${_transitive_outputs})
@@ -1025,12 +1035,19 @@ function(_cmake_emit_llvmir_detect_offload target)
     if(_source MATCHES "^\\$<" OR _source MATCHES ">$" OR _source MATCHES "^<")
       continue()
     endif()
-    get_property(_language SOURCE "${_source}" TARGET_DIRECTORY "${target}" PROPERTY LANGUAGE)
+    set(_property_source "${_source}")
+    if(NOT IS_ABSOLUTE "${_source}")
+      get_target_property(_binary_dir "${target}" BINARY_DIR)
+      if(NOT EXISTS "${_source_dir}/${_source}" AND EXISTS "${_binary_dir}/${_source}")
+        set(_property_source "${_binary_dir}/${_source}")
+      endif()
+    endif()
+    get_property(_language SOURCE "${_property_source}" TARGET_DIRECTORY "${target}" PROPERTY LANGUAGE)
     if(_language MATCHES "^(HIP|CUDA)$" OR _source MATCHES "\\.(hip|cu)$")
       set_property(TARGET "${target}" PROPERTY EMIT_LLVMIR_SKIP_REASON "HIP/CUDA source")
     endif()
     foreach(_property IN ITEMS COMPILE_OPTIONS COMPILE_FLAGS)
-      get_property(_value SOURCE "${_source}" TARGET_DIRECTORY "${target}" PROPERTY ${_property})
+      get_property(_value SOURCE "${_property_source}" TARGET_DIRECTORY "${target}" PROPERTY ${_property})
       list(APPEND _options "${_value}")
     endforeach()
   endforeach()
@@ -1099,6 +1116,7 @@ function(cmake_emit_llvmir_process_target target)
   endif()
 
   if(NOT _target_sources)
+    set_property(TARGET ${target} PROPERTY EMIT_LLVMIR_NO_BITCODE TRUE)
     return()
   endif()
 
@@ -1212,7 +1230,11 @@ function(cmake_emit_llvmir_process_target target)
       # that identity for compile_commands.json matching and build ordering.
       # Source properties are scoped to the directory that creates the
       # target, not to this module's top-level inclusion directory.
-      get_property(_source_is_generated SOURCE "${_source}"
+      set(_property_source "${_source}")
+      if(NOT EXISTS "${_target_source_dir}/${_source}" AND EXISTS "${_target_binary_dir}/${_source}")
+        set(_property_source "${_target_binary_dir}/${_source}")
+      endif()
+      get_property(_source_is_generated SOURCE "${_property_source}"
         TARGET_DIRECTORY "${target}" PROPERTY GENERATED)
       set(_source_dir_path "${_target_source_dir}/${_source}")
       set(_binary_dir_path "${_target_binary_dir}/${_source}")
@@ -1263,9 +1285,17 @@ function(cmake_emit_llvmir_process_target target)
       continue()
     endif()
 
+    # Qt includes some .cpp files from other translation units and marks them
+    # HEADER_FILE_ONLY. They have no independent compilation database entry.
+    get_source_file_property(_header_only "${_source_path}"
+      TARGET_DIRECTORY "${target}" HEADER_FILE_ONLY)
+    if(_header_only)
+      continue()
+    endif()
+
     # Get language from source file properties, with fallback to extension
     set(_lang "")
-    get_source_file_property(_lang "${_source}" LANGUAGE)
+    get_source_file_property(_lang "${_source_path}" TARGET_DIRECTORY "${target}" LANGUAGE)
     if(NOT _lang OR _lang STREQUAL "_lang-NOTFOUND")
       # Infer language from file extension
       if(_source MATCHES "\\.(c|C)$")
@@ -1345,6 +1375,15 @@ function(cmake_emit_llvmir_process_target target)
     continue()
   endforeach()
 
+  # Header-only static shims (for example XNNPACK's fp16/fxdiv targets)
+  # produce empty native archives. Record the absence of IR so consumers do
+  # not invent an archive path, while still walking transitive dependencies.
+  if(NOT _bc_files)
+    _cmake_emit_llvmir_target_has_assembly_sources(${target} _has_assembly)
+    if(NOT _has_assembly)
+      set_property(TARGET ${target} PROPERTY EMIT_LLVMIR_NO_BITCODE TRUE)
+    endif()
+  endif()
   if(_bc_files)
     list(REMOVE_DUPLICATES _bc_files)
 
@@ -1775,8 +1814,16 @@ endfunction()
 # Collect all project targets before registering LLVMIR commands. Static-library
 # outputs are shared by their consumers, so they must be registered first.
 function(_cmake_emit_llvmir_collect_directory_targets dir result_var)
-  get_property(_targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
   get_property(_binary_dir DIRECTORY ${dir} PROPERTY BINARY_DIR)
+  get_property(_visited_dirs GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_VISITED_SOURCE_DIRS)
+  if("${_binary_dir}" IN_LIST _visited_dirs)
+    set(${result_var} "" PARENT_SCOPE)
+    return()
+  endif()
+  list(APPEND _visited_dirs "${_binary_dir}")
+  set_property(GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_VISITED_SOURCE_DIRS "${_visited_dirs}")
+
+  get_property(_targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
   foreach(_target IN LISTS _targets)
     set_property(GLOBAL PROPERTY
       "CMAKE_EMIT_LLVMIR_TARGET_BINARY_DIR_${_target}" "${_binary_dir}")
@@ -1807,6 +1854,8 @@ function(_cmake_emit_llvmir_process_all_targets)
   if(NOT CMAKE_EMIT_LLVMIR_ENABLED)
     return()
   endif()
+
+  set_property(GLOBAL PROPERTY CMAKE_EMIT_LLVMIR_VISITED_SOURCE_DIRS "")
 
   # CMAKE_PROJECT_TOP_LEVEL_INCLUDES is evaluated before project() enables
   # languages, so GNUInstallDirs must be initialized here rather than at load.

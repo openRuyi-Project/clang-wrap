@@ -1,6 +1,27 @@
 set(_fixture_source "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/selection")
 set(_module "${PROJECT_SOURCE_DIR}/cmake/CMakeEmitLLVMIR.cmake")
 add_test(
+  NAME cmake-emit-llvmir-header-only-source
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/header-only-source
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-header-only-source.cmake
+)
+add_test(
+  NAME cmake-emit-llvmir-empty-static
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/empty-static
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-empty-static.cmake
+)
+add_test(
+  NAME cmake-emit-llvmir-configure-generated-source
+  COMMAND ${CMAKE_COMMAND}
+    -DMODULE_FILE=${_module}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/configure-generated-source
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run-configure-generated-source.cmake
+)
+add_test(
   NAME cmake-emit-llvmir-project-command-wrappers
   COMMAND ${CMAKE_COMMAND}
     -DMODULE_FILE=${_module}

@@ -14,6 +14,14 @@ configure_file("${CMAKE_CURRENT_BINARY_DIR}/package.in" pkgscripts/makerpm COPYO
 add_custom_target(rpm pkgscripts/makerpm SOURCES pkgscripts/makerpm)
 add_library(gpu STATIC EXCLUDE_FROM_ALL value.cpp)
 target_compile_options(gpu PRIVATE -x hip --offload-arch=gfx1100)
+# MIOpen mixes host C++ with a configure-generated kernel.cpp whose HIP flags
+# are source properties, rather than target-wide compile options.
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/kernel.cpp" "int kernel() { return 2; }\n")
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/kernel.cpp" PROPERTIES
+  COMPILE_FLAGS "-x hip --offload-arch=gfx1100 --offload-arch=gfx1101 --offload-arch=gfx1200 --offload-arch=gfx1201")
+add_library(miopen SHARED EXCLUDE_FROM_ALL value.cpp "${CMAKE_CURRENT_BINARY_DIR}/kernel.cpp")
+target_compile_definitions(miopen PRIVATE "HIP_COMPILER_FLAGS=\" -x hip --hip-link \"")
+install(TARGETS miopen DESTINATION lib)
 add_library(consumer STATIC EXCLUDE_FROM_ALL value.cpp)
 target_link_libraries(consumer PRIVATE gpu)
 # Model MAGMA's imported hip::device and transitive shared-library usage.
@@ -67,7 +75,7 @@ if(NOT _result EQUAL 0)
   message(FATAL_ERROR "Configure failed: ${_output}\n${_error}")
 endif()
 file(READ "${WORK_DIR}/build/build.ninja" _ninja)
-foreach(_target IN ITEMS gpu consumer magma tester magma_sparse imported_options imported_marker private_gpu)
+foreach(_target IN ITEMS gpu miopen consumer magma tester magma_sparse imported_options imported_marker private_gpu)
   if(_ninja MATCHES "build ${_target}_llvmir:" OR
      _ninja MATCHES "-DTARGET_NAME=${_target} " OR
      NOT _output MATCHES "skipping LLVM IR for ${_target}:")
@@ -87,6 +95,6 @@ if(NOT _result EQUAL 0)
   message(FATAL_ERROR "Ordinary C++ IR build failed: ${_output}\n${_error}")
 endif()
 file(READ "${WORK_DIR}/build/cmake_install.cmake" _install)
-if(_install MATCHES "llvmir/lib(gpu|consumer|magma|tester|magma_sparse|imported_options|imported_marker)\\.(a|so)")
+if(_install MATCHES "llvmir/lib(gpu|miopen|consumer|magma|tester|magma_sparse|imported_options|imported_marker)\\.(a|so)")
   message(FATAL_ERROR "Skipped targets still have IR install rules")
 endif()

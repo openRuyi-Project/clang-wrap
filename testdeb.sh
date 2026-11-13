@@ -248,7 +248,9 @@ test_sqlite3() {
 		cd ${pkg}-*
 		mkdir -p build-with-clangwrap && cd build-with-clangwrap
 		rm -rf ~/tmp/llvmir/`pwd`
-		CC=clang CXX=clang++ ../configure && make V=1 -j`nproc` && make install DESTDIR=`pwd`/install
+		CC=clang CXX=clang++ CFLAGS="-O2 -flto=auto -ffat-lto-objects" LDFLAGS="-flto=auto" ../configure && \
+			make V=1 CFLAGS="-O2 -flto=auto -ffat-lto-objects" LDFLAGS="-flto=auto" -j`nproc` && \
+			make install DESTDIR=`pwd`/install
 		run_llvmir_cmds install/usr/local/lib/llvmir
 		run_llvmir_cmds install/usr/local/lib/llvmir-bin
 	)
@@ -452,6 +454,73 @@ test_btrfs_progs() {
 	)
 }
 
+# 测试 jemalloc 对 EMIT_LLVMIR 架构参数和 -Werror 链接选项的兼容性
+test_jemalloc() {
+	pkg=jemalloc
+	export CLANG_WRAP_DEBUG=1
+	export EMIT_LLVMIR=-march=x86-64-v4
+	export PATH="$(pwd)/clang-wrap-install/bin:$PATH"
+	export CC=clang-22
+	mkdir -p "testdeb/$pkg"
+	(
+		cd "testdeb/$pkg"
+		if ! find . -mindepth 1 -maxdepth 1 -type d -name 'jemalloc-*' -print -quit | grep -q .; then
+			apt-get source "$pkg"
+		fi
+		cd jemalloc-*
+		if [ ! -f configure ]; then
+			./autogen.sh
+		fi
+		mkdir -p build-with-clangwrap && cd build-with-clangwrap
+		llvmir_build="$HOME/tmp/llvmir/$(pwd | sed 's#^/##')"
+		CC="$CC" ../configure
+		make V=1 -j"$(nproc)"
+
+		object_count=0
+		for object in $(find . -type f -name '*.o' -print); do
+			ir_file="$llvmir_build/${object#./}"
+			[ -s "$ir_file" ] || continue
+			if file "$ir_file" | grep -q 'LLVM IR bitcode'; then
+				"$CC" -x ir -S -emit-llvm "$ir_file" -o /dev/null
+				object_count=$((object_count + 1))
+			fi
+		done
+		if [ "$object_count" -eq 0 ]; then
+			echo "ERROR: jemalloc 构建没有生成对象文件" >&2
+			return 1
+		fi
+		echo "验证通过：$object_count 个 jemalloc 对象 bitcode 可由 Clang 解析"
+
+		make install DESTDIR="$(pwd)/install"
+		lib_cmd_count=0
+		for cmd in "$llvmir_build"/lib/libjemalloc*.so*_cmd; do
+			[ -f "$cmd" ] || continue
+			echo "Converting: $cmd ..."
+			(cd "$(dirname "$cmd")" && bash "$(basename "$cmd")")
+			converted_output="$(sed -n 's/^[[:space:]]*--output=//p' "$cmd" | tail -1)"
+			if [ -z "$converted_output" ] || [ ! -s "$(dirname "$cmd")/$converted_output" ]; then
+				echo "ERROR: 转换脚本没有生成预期输出: $converted_output" >&2
+				return 1
+			fi
+			file "$(dirname "$cmd")/$converted_output" | grep -q 'ELF .*shared object'
+			lib_cmd_count=$((lib_cmd_count + 1))
+		done
+		if [ "$lib_cmd_count" -eq 0 ]; then
+			echo "ERROR: jemalloc 库没有生成 LLVM IR 重链接脚本" >&2
+			return 1
+		fi
+		echo "验证通过：$lib_cmd_count 个 jemalloc 共享库转换脚本执行成功"
+
+		ir_install="$(pwd)/install/usr/local/lib/llvmir"
+		if ! find "$ir_install" -type f -name '*_cmd' -print -quit | grep -q .; then
+			echo "ERROR: jemalloc 安装树中没有 LLVM IR 链接脚本" >&2
+			return 1
+		fi
+		run_llvmir_cmds "$ir_install"
+		run_llvmir_cmds "$(pwd)/install/usr/local/lib/llvmir-bin"
+	)
+}
+
 # 显示帮助信息
 show_help() {
 	echo "用法: $0 [命令]"
@@ -477,6 +546,7 @@ show_help() {
 	echo "  elfutils     - 测试 elfutils 包"
 	echo "  skalibs      - 测试 skalibs 包"
 	echo "  btrfs-progs  - 测试 btrfs-progs 包"
+	echo "  jemalloc     - 测试 jemalloc 包（构建、IR 校验和库转换）"
 	echo "  all          - 构建并测试所有包"
 	echo "  help         - 显示此帮助信息"
 	echo ""
@@ -545,6 +615,9 @@ main() {
 			;;
 		btrfs-progs)
 			test_btrfs_progs
+			;;
+		jemalloc)
+			test_jemalloc
 			;;
 		all)
 			build

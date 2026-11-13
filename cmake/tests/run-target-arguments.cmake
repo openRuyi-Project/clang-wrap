@@ -4,8 +4,7 @@ file(WRITE "${WORK_DIR}/source/CMakeLists.txt" "
 cmake_minimum_required(VERSION 3.24)
 project(TargetArguments C)
 include(\"${MODULE_FILE}\")
-# Exercise forwarding without passing semicolon paths to the IR generators.
-set(CMAKE_EMIT_LLVMIR_ENABLED FALSE)
+# Exercise argument forwarding while leaving LLVM IR processing enabled.
 add_library(argument_library STATIC \"part\\;source.c\")
 add_executable(argument_executable \"part\\;source.c\")
 ")
